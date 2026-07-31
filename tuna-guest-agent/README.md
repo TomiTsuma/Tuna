@@ -24,41 +24,43 @@ The system works by intercepting key system calls and API-level operations (file
 ```
 tuna-guest-agent/
 ├── src/
-│   ├── gui/                        # Qt-based graphical frontend
-│   │   ├── main.cpp                # GUI entry point
-│   │   ├── mainwindow.ui           # Main window layout (Qt Designer)
-│   │   ├── mainwindow.cpp          # GUI logic and slot definitions
-│   │   ├── settings_dialog.cpp     # Connection settings and credentials UI
-│   │   ├── tray_icon.cpp           # System tray & notifications
-│   │   └── resources/              # App icons, themes, and translations
+│   ├── core/                       # OS-agnostic config, logging, error handling
+│   │   ├── config_manager.cpp
+│   │   ├── logger.cpp
+│   │   ├── error_handler.cpp
+│   │   └── platform_utils.cpp
 │   │
 │   ├── daemon/                     # Background service (Tuna Daemon)
-│   │   ├── daemon_main.cpp         # Daemon entry point
-│   │   ├── daemon_service.cpp      # Service lifecycle management
-│   │   ├── privilege_utils.cpp     # Handles privilege elevation
-│   │   ├── daemon_logger.cpp       # Centralized logging subsystem
-│   │   └── watchdog.cpp            # Auto-restart and crash recovery
+│   │   └── win/                    # Windows Service implementation
+│   │       ├── daemon_main.cpp
+│   │       ├── daemon_service.cpp
+│   │       ├── privilege_utils.cpp
+│   │       └── watchdog.cpp
 │   │
-│   ├── syscall_hooks/              # Hooking and interception logic
-│   │   ├── hooks_init.cpp          # Hook initialization and teardown
-│   │   ├── file_hooks.cpp          # Intercepts open(), read(), write(), close()
-│   │   ├── graphics_hooks.cpp      # Hooks OpenGL, Vulkan, DirectX APIs
-│   │   ├── process_hooks.cpp       # Hooks fork(), exec(), system()
-│   │   ├── network_hooks.cpp       # Hooks socket(), connect(), send(), recv()
-│   │   └── memory_hooks.cpp        # Hooks mmap(), malloc(), free()
+│   ├── hooks/                      # Hooking and interception logic
+│   │   └── win/                    # MinHook-based Win32/DirectX/CUDA hooks
+│   │       ├── hooks_init.cpp
+│   │       ├── file_hooks.cpp
+│   │       ├── graphics_hooks.cpp
+│   │       ├── process_hooks.cpp
+│   │       ├── network_hooks.cpp
+│   │       ├── memory_hooks.cpp
+│   │       ├── hook_handlers.cpp
+│   │       └── hook_handlers.h
 │   │
-│   ├── tunneling/                  # Communication and transport layer
-│   │   ├── quic_tunnel.cpp         # QUIC + TLS tunnel creation
-│   │   ├── multiplexing_layer.cpp  # Stream multiplexing and prioritization
-│   │   ├── data_serializer.cpp     # Binary serialization / deserialization
-│   │   ├── handshake_protocol.cpp  # Authentication and session setup
-│   │   └── heartbeat.cpp           # Keep-alive and latency measurement
+│   ├── tunnel/                     # Communication and transport layer
+│   │   ├── quic_tunnel.cpp
+│   │   ├── multiplexing_layer.cpp
+│   │   ├── data_serializer.cpp
+│   │   ├── handshake_protocol.cpp
+│   │   └── heartbeat.cpp
 │   │
-│   ├── utils/
-│   │   ├── config_manager.cpp      # Load/save configuration files
-│   │   ├── logger.cpp              # Shared logging API
-│   │   ├── error_handler.cpp       # Centralized error and exception handling
-│   │   └── platform_utils.cpp      # OS-specific helper functions
+│   ├── gui/                        # Qt-based graphical frontend
+│   │   ├── main.cpp
+│   │   ├── mainwindow.ui
+│   │   ├── mainwindow.cpp
+│   │   ├── settings_dialog.cpp
+│   │   └── tray_icon.cpp
 │   │
 │   └── main.cpp                    # Unified entry point (launches GUI or daemon)
 │
@@ -69,12 +71,15 @@ tuna-guest-agent/
 │   ├── tunneling_protocol.md
 │   └── security_model.md
 │
+├── minhook/                         # Vendored as a git submodule (TsudaKageyu/minhook)
+│
 ├── build/                          # Compiled binaries and build artifacts
 │
 ├── tests/
-│   ├── unit/                       # Unit tests for small components
+│   ├── unit/                       # Unit tests (Catch2)
 │   ├── integration/                # End-to-end tests (hooks + tunnel)
-│   └── mocks/                      # Mock syscall and server simulators
+│   ├── createfile_hook.c           # Reference prototype for the Phase 3 CreateFileW hook
+│   └── main.c                      # Reference ETW-based file-monitoring experiment (not part of the build)
 │
 ├── CMakeLists.txt                  # Build configuration
 ├── LICENSE
