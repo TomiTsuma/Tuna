@@ -20,3 +20,25 @@ add_executable(tuna_gui
 )
 
 target_link_libraries(tuna_gui PRIVATE Qt6::Widgets Qt6::Network)
+
+# --- Test harness (Catch2 + CTest) ---
+include(FetchContent)
+FetchContent_Declare(
+    Catch2
+    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+    GIT_TAG v3.7.1
+)
+FetchContent_MakeAvailable(Catch2)
+
+enable_testing()
+list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
+include(Catch)
+
+add_executable(tuna_tests
+    tests/unit/test_config.cpp
+    tests/unit/test_hooks.cpp
+    tests/unit/test_tunnel.cpp
+    tests/integration/test_full_agent.cpp
+)
+target_link_libraries(tuna_tests PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(tuna_tests)
