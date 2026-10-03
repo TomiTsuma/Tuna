@@ -1,0 +1,8 @@
+{
+  "name": "tuna-windows-client",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "grpc",
+    "protobuf"
+  ]
+}

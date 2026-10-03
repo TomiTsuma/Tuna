@@ -1,215 +1,50 @@
-# Tuna Guest Agent – Architecture Overview
+# Tuna Client/Server Architecture
 
-## 1. Introduction
+## Product boundary
 
-**Tuna Guest Agent** is the client-side component of the Tuna virtualization ecosystem. It acts as a lightweight system daemon that transparently redirects heavy computation tasks from the client’s machine to a high-performance remote server (running Tuna Server). The user experiences no disruption or latency in their normal application workflow — applications such as Adobe Photoshop, Blender, or other compute-intensive software continue to behave as if they were running locally.
+The Windows client and Linux server are separate platform-specific programs that share a versioned protobuf/gRPC contract. The Windows desktop GUI is a management surface; it must not be treated as the transport or execution engine. The Linux server hosts explicitly supported workloads and must not receive arbitrary Windows process memory or system calls.
 
-At its core, Tuna Guest Agent bridges local user interactions and remote compute execution, allowing low-spec machines to leverage high-end GPUs, CPUs, and RAM available on the Tuna Server through a secure and multiplexed tunnel.
+The first milestone is deliberately narrow: a Windows sample application calls a custom `RemoteSumOfSquares` API. The client library authenticates to the server with mutual TLS and forwards the bounded request. The Linux service validates the certificate identity and request, computes the result, and returns it. This is API-level forwarding for a purpose-built sample, not interception of an unmodified third-party application.
 
----
+## Current component boundaries
 
-## 2. High-Level Architecture
-
-```
-+---------------------------------------------------------------+
-|                  Client (Local Computer)                      |
-|                                                               |
-|  +-------------------+      +-------------------------------+ |
-|  |   User Software   | ---> |   Tuna Guest Agent (Service)  | |
-|  | (Photoshop, etc.) |      +-------------------------------+ |
-|  |                   |        |                              |
-|  |   Syscalls / API  |<-------| Hook Manager (MinHook)       |
-|  +-------------------+        |                              |
-|                               | Tunnel Manager (gRPC/TLS)    |
-|                               | Encryption & Auth Layer      |
-|                               | I/O Redirector               |
-|                               | Compute Redirector           |
-|                               +-------------------------------+
-|                               |  GUI Frontend (Optional)     |
-|                               +-------------------------------+
-+-------------------------------|--------------------------------
-                                |
-                                v
-+---------------------------------------------------------------+
-|                  Tuna Server (Remote Machine)                 |
-|  +----------------------------------------------------------+ |
-|  |  Virtualization Layer (Hyper-V / Tuna VM Engine)         | |
-|  |  Remote Compute Daemon                                   | |
-|  |  GPU/CPU Resource Pool                                   | |
-|  |  I/O Sync & Cache Engine                                 | |
-|  |  Secure Tunnel Endpoint (TLS Multiplexed)                | |
-|  +----------------------------------------------------------+ |
-+---------------------------------------------------------------+
+```text
+Windows 10/11 x64                         Ubuntu 22.04/24.04 x64
++----------------------------+            +----------------------------+
+| Sample application         |            | gRPC service               |
+|   custom Tuna API          |-- mTLS ---->|   SAN authorization        |
+|   gRPC client library      |  HTTP/2     |   input limits / workload  |
+|   Qt GUI prototype         |            |   checked result handling  |
++----------------------------+            +----------------------------+
+             \________ shared protocol/tuna/v1/workload.proto ________/
 ```
 
----
+The sample service uses administrator-managed certificates. The client validates the server trust chain and DNS name. The server validates client certificates and permits the configured subject alternative name. TLS 1.3 is the production minimum; actual minimum-version enforcement remains a release gate for the selected gRPC/TLS build.
 
-## 3. Key Components and Their Roles
+## Source layout
 
-### 3.1 Tuna Guest Agent Core
+- `client/`: Windows C++ gRPC API and sample command-line application.
+- `src/gui/`: Qt UI. Settings are stored per user and the sample workload runs the RPC CLI asynchronously; no persistent session is maintained.
+- `protocol/tuna/v1/`: versioned protobuf contract shared by client and server.
+- `tuna-server/`: independently configured Linux CMake service and unit tests.
+- `docs/`: product plan, protocol, security, interception limitations, and lifecycle design.
 
-A background Windows Service that:
+## First workload semantics
 
-* Maintains a persistent, encrypted connection to Tuna Server.
-* Monitors system events and application launches.
-* Dynamically hooks selected system and API calls (e.g., GPU or disk access).
-* Routes intercepted calls to the remote execution layer.
+`RemoteSumOfSquares` accepts a non-empty list of at most 4,096 unsigned 64-bit values and returns the checked sum of their squares. Unsupported versions, invalid IDs, oversized batches, unauthorized client identities, and arithmetic overflow fail with explicit gRPC status codes. The service does not persist request data. The sample client has a finite RPC deadline and does not fall back to local computation when remote work fails.
 
-### 3.2 Syscall Interceptor (Hook Manager)
+The example workload is CPU-only. The intended initial server has an NVIDIA RTX 3060 12 GB, but no CUDA code, GPU scheduling, or GPU isolation is implemented by this slice.
 
-* Uses **MinHook** or **Microsoft Detours** to intercept low-level Win32 API or kernel calls.
-* Forwards intercepted calls (like GPU compute or file I/O) to Tuna Server.
-* Restores or bypasses hooks when no remote connection is active.
+## Future components — not yet implemented
 
-### 3.3 Tunnel Manager
+- GUI-to-client configuration/status integration and a least-privilege local IPC contract.
+- Windows background service, installer, signing, upgrade, and recovery.
+- Linux account provisioning, production packaging/update automation, firewall, workload quotas, logs/metrics, and deployment automation. A systemd unit template and basic CMake install rules now exist.
+- Certificate enrollment/rotation/revocation and identity administration.
+- Explicit additional workload adapters and workload-level resource isolation.
+- GPU adapters for a specified CUDA/runtime/hardware matrix.
+- Any process injection or OS/graphics/file/network API interception. Such work requires a separate threat model, supported-app matrix, compatibility criteria, and safe rollback design.
 
-* Implements secure gRPC/ZeroMQ channels over TLS.
-* Multiplexes different data streams (compute, I/O, control, metrics).
-* Supports encryption, authentication, and session resumption.
-* Ensures data compression and latency optimization.
+## Compatibility and operations
 
-### 3.4 Compute Redirector
-
-* Detects when CPU/GPU-bound tasks are invoked.
-* Serializes execution context (function name, parameters, memory references).
-* Sends the context to the Tuna Server for remote execution.
-* Receives computed results and reinjects them into the local process space transparently.
-
-### 3.5 I/O Redirector
-
-* Provides transparent file I/O proxying.
-* Syncs read/write operations between client and server.
-* Maintains a local cache to prevent latency from affecting responsiveness.
-
-### 3.6 Configuration Manager
-
-* Loads and validates `defaults.json`.
-* Handles certificate-based authentication and connection settings.
-* Manages daemon startup and failure recovery.
-
-### 3.7 GUI Interface (Optional)
-
-* Built with Electron or Qt.
-* Displays connection status, server usage, and logs.
-* Allows user to configure server address, port, and credentials.
-
----
-
-## 4. Communication Flow
-
-1. **Initialization**
-
-   * The Tuna Guest Agent daemon starts at system boot.
-   * It reads configuration and establishes a secure tunnel to Tuna Server.
-
-2. **Hook Registration**
-
-   * Hooks are registered on key APIs (e.g., DirectX/OpenGL, file I/O).
-   * Hook Manager monitors target processes and dynamically injects hooks.
-
-3. **Execution Redirection**
-
-   * When the user runs a heavy operation (e.g., applying a Photoshop filter), the relevant syscall is intercepted.
-   * The call context and data are serialized and sent to Tuna Server.
-
-4. **Remote Execution**
-
-   * Tuna Server executes the operation using its own GPU/CPU.
-   * The output is sent back via the tunnel to Tuna Guest Agent.
-
-5. **Result Reinjection**
-
-   * Tuna Guest Agent reinjects results into the calling process memory space.
-   * To the user, the application behaves as if everything was done locally.
-
----
-
-## 5. Security Considerations
-
-* **TLS 1.3** encryption for all tunnel communication.
-* **Mutual authentication** (client and server certificates).
-* **Process sandboxing**: Tuna Guest Agent runs with limited privileges.
-* **Integrity checks**: All transmitted binaries or buffers are hashed.
-* **Zero-trust posture**: No filesystem-level access from server without explicit permission.
-
----
-
-## 6. Performance Optimizations
-
-* **Zero-copy buffers** between intercepted processes and tunnel stream.
-* **Async batching** for small syscalls to minimize overhead.
-* **Local caching** for repeated reads and unmodified resources.
-* **Compression** (LZ4 or zstd) for data transfer efficiency.
-
----
-
-## 7. Fault Tolerance and Recovery
-
-* Automatic reconnection if the tunnel drops.
-* Graceful degradation: fall back to local compute if server unavailable.
-* Transaction rollback for I/O operations.
-* Periodic heartbeats to monitor tunnel health.
-
----
-
-## 8. Development Roadmap
-
-| Phase   | Deliverable            | Key Features                            |
-| ------- | ---------------------- | --------------------------------------- |
-| Phase 1 | Core Daemon            | Service startup, basic TLS tunnel       |
-| Phase 2 | Syscall Hooking        | Intercept GPU/IO syscalls               |
-| Phase 3 | Remote Execution       | Task serialization & result reinjection |
-| Phase 4 | GUI Dashboard          | User config, monitoring, and logs       |
-| Phase 5 | Optimization & Caching | Latency reduction, performance tuning   |
-
----
-
-## 9. Future Extensions
-
-* Linux/macOS support using equivalent system hooks.
-* Multi-server load balancing.
-* Dynamic GPU allocation across multiple clients.
-* Integration with containerized workloads.
-
----
-
-## ✅ 10. Implementation Checklist
-
-**Phase 1 – Setup**
-
-* [ ] Create base project with CMake + Windows Service template.
-* [ ] Define `tuna.proto` and generate gRPC stubs.
-* [ ] Implement secure TLS handshake and tunnel connection.
-
-**Phase 2 – Hooking**
-
-* [ ] Integrate MinHook for syscall interception.
-* [ ] Implement test hooks (GPU API, file read).
-* [ ] Serialize and send intercepted context to mock server.
-
-**Phase 3 – Remote Execution**
-
-* [ ] Implement Compute Redirector and response injection.
-* [ ] Validate latency and response consistency.
-* [ ] Add I/O proxy and caching mechanisms.
-
-**Phase 4 – GUI**
-
-* [ ] Build Electron-based GUI for control and monitoring.
-* [ ] Integrate GUI with service via local API bridge.
-
-**Phase 5 – Security and Stability**
-
-* [ ] Add certificate-based mutual authentication.
-* [ ] Harden tunnel and daemon privileges.
-* [ ] Implement auto-reconnect and logging.
-
-**Phase 6 – Testing**
-
-* [ ] Create full integration test with Photoshop or CUDA app.
-* [ ] Benchmark CPU/GPU forwarding performance.
-* [ ] Validate recovery from tunnel interruptions.
-
----
-
-**End of Document**
+The `tuna.v1` protobuf package is the compatibility boundary. Additive optional fields can be added within v1; semantic or incompatible changes require a new major package/service version. Both sides must generate code from the checked-in schema and run contract tests. Deployment, protocol compatibility, certificate changes, server restarts, and client/server version skew must be tested before broad workload support.
