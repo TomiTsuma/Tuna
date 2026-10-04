@@ -1,6 +1,6 @@
 # Tuna Windows Client and Linux Server
 
-Tuna is being developed as a **Windows client** that calls a separately built **Linux server**. This repository currently contains a Qt dashboard prototype and an early gRPC sample workload path. It does not yet provide general-purpose remote execution or transparent interception of third-party applications.
+Tuna is being developed as a **Windows client** that calls a separately built **Linux server**. The Qt frontend supports connection settings and the bounded sample workload flow. Tuna does not provide general-purpose remote execution or transparent interception of third-party applications.
 
 ## MVP boundary
 
@@ -18,7 +18,7 @@ tuna-server/                     Separate Linux server CMake project, tests, and
 docs/                             Architecture, protocol, security, and roadmap
 ```
 
-The GUI uses the sample RPC executable for the bounded test workload; it does not maintain a persistent session. Connection settings are saved with Qt's per-user settings store. The dashboard displays the last RPC result and supports cancelling a running request, while unrelated process/GPU/throughput metrics remain unavailable.
+The GUI uses the sample RPC executable for the bounded test workload; it does not maintain a persistent session. Connection settings are saved with Qt's per-user settings store. Its workload screen reports request progress/result and supports cancellation; a separate activity screen shows only events from the current GUI session. Process forwarding, persistent sessions, and live CPU/GPU/latency/throughput telemetry are not implemented and are not represented as dashboard metrics or counts.
 
 ## Dependencies
 

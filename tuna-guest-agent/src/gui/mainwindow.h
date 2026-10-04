@@ -4,14 +4,14 @@
 #include "settings_dialog.h"
 
 class QLabel;
-class QProgressBar;
 class QTabWidget;
 class QPushButton;
-class QSystemTrayIcon;
 class QLineEdit;
 class QTextEdit;
 class QProcess;
 class QTimer;
+class QWidget;
+class QCloseEvent;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -20,13 +20,14 @@ public:
     ~MainWindow() override = default;
 
 private:
+    void closeEvent(QCloseEvent* event) override;
     QWidget* buildDashboard();
-    QWidget* buildPerformance();
-    QWidget* buildProcesses();
-    QWidget* buildTunnel();
-    QWidget* buildLogs();
+    QWidget* buildActivity();
     void buildMenus();
-    void buildTray();
+    void openSettings();
+    void updateConfigurationDisplay();
+    void appendActivity(const QString& message);
+    bool configurationIsReady() const;
     void onRunWorkload();
     void onWorkloadFinished(int exitCode, int exitStatus);
     bool saveSettings(const ClientSettings& settings);
@@ -35,13 +36,9 @@ private:
     // Dashboard widgets
     QLabel* statusLabel_{};
     QLabel* serverLabel_{};
-    QLabel* uptimeLabel_{};
-    QLabel* tlsLabel_{};
-    QLabel* protocolLabel_{};
-    QProgressBar* cpuBar_{};
-    QProgressBar* gpuBar_{};
-    QProgressBar* latencyBar_{};
-    QPushButton* runWorkloadHeaderButton_{};
+    QLabel* securityLabel_{};
+    QLabel* resultLabel_{};
+    QPushButton* configureButton_{};
     QPushButton* runWorkloadButton_{};
     QPushButton* cancelWorkloadButton_{};
     QLineEdit* workloadInput_{};
@@ -52,5 +49,4 @@ private:
     bool requestTimedOut_{};
     bool requestCancelled_{};
     ClientSettings settings_;
-    QSystemTrayIcon* tray_{};
 };

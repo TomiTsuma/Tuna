@@ -24,7 +24,7 @@ The sample service uses administrator-managed certificates. The client validates
 ## Source layout
 
 - `client/`: Windows C++ gRPC API and sample command-line application.
-- `src/gui/`: Qt UI. Settings are stored per user and the sample workload runs the RPC CLI asynchronously; no persistent session is maintained.
+- `src/gui/`: Qt UI for per-user settings, the bounded sample workload, and in-session activity. It launches the RPC CLI asynchronously; no persistent session, process forwarding, or live telemetry is implemented.
 - `protocol/tuna/v1/`: versioned protobuf contract shared by client and server.
 - `tuna-server/`: independently configured Linux CMake service and unit tests.
 - `docs/`: product plan, protocol, security, interception limitations, and lifecycle design.

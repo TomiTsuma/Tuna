@@ -28,7 +28,6 @@ if(TUNA_BUILD_GUI)
         src/gui/main.cpp
         src/gui/mainwindow.cpp
         src/gui/mainwindow.h
-        src/gui/mainwindow.ui
         src/gui/settings_dialog.cpp
         src/gui/settings_dialog.h
     )
