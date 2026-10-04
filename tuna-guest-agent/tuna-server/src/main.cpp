@@ -1,4 +1,5 @@
 #include "workload_service.h"
+#include "gpu_matrix.h"
 
 #include <iostream>
 #include <fstream>
@@ -63,6 +64,13 @@ int main(int argc, char* argv[]) {
             return 2;
         }
 
+#ifdef TUNA_ENABLE_CUDA
+        std::string gpu_error;
+        if (!verify_gpu_available(&gpu_error)) {
+            throw std::runtime_error("required CUDA GPU is unavailable: " + gpu_error);
+        }
+#endif
+
         grpc::SslServerCredentialsOptions credentials_options;
         credentials_options.pem_root_certs = [&options] {
             std::ifstream file(options.client_ca_file, std::ios::binary);
@@ -89,8 +97,8 @@ int main(int argc, char* argv[]) {
 
         WorkloadService service(options.allowed_client_san);
         grpc::ServerBuilder builder;
-        builder.SetMaxReceiveMessageSize(64 * 1024);
-        builder.SetMaxSendMessageSize(1024);
+        builder.SetMaxReceiveMessageSize(4 * 1024 * 1024);
+        builder.SetMaxSendMessageSize(4 * 1024 * 1024);
         builder.AddListeningPort(options.listen_address, grpc::SslServerCredentials(credentials_options));
         builder.RegisterService(&service);
         std::unique_ptr<grpc::Server> server = builder.BuildAndStart();

@@ -6,7 +6,7 @@ Tuna is being developed as a **Windows client** that calls a separately built **
 
 The first end-to-end API is `RemoteSumOfSquares`: a small Windows sample app sends 1–4,096 unsigned integers to an Ubuntu server and receives the checked sum of their squares. The service requires administrator-provisioned mutual TLS certificates and permits a configured client certificate SAN. It is a protocol/workload vertical slice, not a GPU benchmark.
 
-The intended Linux deployment host is Ubuntu 22.04/24.04 x64 with an NVIDIA RTX 3060 12 GB. This first workload is CPU-only. It does not use CUDA or intercept arbitrary Windows APIs, graphics calls, files, processes, or existing applications such as Photoshop or Blender. Such support requires separate workload adapters, compatibility and security design, and validation before it can be claimed.
+The first-release GPU baseline is Ubuntu 22.04/24.04 x64 with an NVIDIA RTX 3060 12 GB (compute capability 8.6) and CUDA Toolkit 12.8. The API includes a CPU sum-of-squares connectivity check and an explicit bounded CUDA matrix-multiplication sample. Neither API intercepts arbitrary Windows APIs, graphics calls, files, processes, or existing applications such as Photoshop or Blender.
 
 ## Repository layout
 
@@ -18,7 +18,7 @@ tuna-server/                     Separate Linux server CMake project, tests, and
 docs/                             Architecture, protocol, security, and roadmap
 ```
 
-The GUI uses the sample RPC executable for the bounded test workload; it does not maintain a persistent session. Connection settings are saved with Qt's per-user settings store. Its workload screen reports request progress/result and supports cancellation; a separate activity screen shows only events from the current GUI session. Process forwarding, persistent sessions, and live CPU/GPU/latency/throughput telemetry are not implemented and are not represented as dashboard metrics or counts.
+The GUI uses the sample RPC executable for bounded smoke-test and matrix workloads; it does not maintain a persistent session. Connection settings are saved with Qt's per-user settings store. Its workload screen reports request progress/result and supports cancellation; a separate activity screen shows only events from the current GUI session. Process forwarding, persistent sessions, and live CPU/GPU/latency/throughput telemetry are not implemented and are not represented as dashboard metrics or counts.
 
 ## Dependencies
 
@@ -67,7 +67,7 @@ cmake --build build-server --parallel
 ctest --test-dir build-server --output-on-failure
 ```
 
-Run these commands from the repository root. The Linux server has its own CMake project. To build both the sample client and server on Linux for the local mTLS integration test, configure the root project with the GUI disabled and server enabled:
+Run these commands from the repository root. The Linux server has its own CMake project. A CPU-only local build is useful for protocol and mTLS development, but is not a GPU-release build. To build both the sample client and server on Linux for the local mTLS integration test, configure the root project with the GUI disabled and server enabled:
 
 ```bash
 cmake -S . -B build-all -DTUNA_BUILD_GUI=OFF \
@@ -78,6 +78,8 @@ ctest --test-dir build-all --output-on-failure
 ```
 
 The integration test creates short-lived certificates in a temporary directory and checks a valid call, rejected client CA and SAN, server-name validation, and arithmetic overflow. Windows CI also launches the sample client with `--help` to catch missing runtime dependencies.
+
+For the production-target GPU build, follow NVIDIA's official CUDA 12.8 installation guidance for the Ubuntu release and compatible driver, verify `nvidia-smi` and `nvcc --version`, then configure the standalone server with `-DTUNA_ENABLE_CUDA=ON`. See [the Linux server guide](tuna-server/README.md). CUDA execution and the systemd device allowlist have not yet been qualified on RTX 3060 hardware.
 
 ## Local mTLS smoke test
 
@@ -107,6 +109,19 @@ Run the Windows sample app with a server name present in the server certificate:
 
 Expected result for `3 4` is `sum_of_squares=25`. Use the real DNS name when connecting to a remote server and ensure it matches the server certificate. A TLS, authentication, timeout, or server error must fail the call; the client does not silently compute locally.
 
+The GPU sample sends deterministic 128×128 matrices to a CUDA-enabled server:
+
+```powershell
+.\build\bin\tuna_sample_app.exe `
+  --server tuna.example.net:50051 `
+  --ca server-ca.crt `
+  --cert client.crt `
+  --key client.key `
+  --matrix-size 128
+```
+
+The GPU API accepts dimensions 128–512. The CPU-only development server returns an explicit unavailable error rather than computing on the CPU.
+
 ## Security and deployment notes
 
 - Mutual TLS is mandatory for the sample service. The client validates the server CA/hostname; the server validates the client CA and configured SAN.
@@ -126,4 +141,4 @@ Expected result for `3 4` is `sum_of_squares=25`. Use the real DNS name when con
 
 ## Current implementation status
 
-Implemented in this initial slice: versioned protobuf schema, Windows gRPC client library/sample CLI, Linux gRPC mTLS server, exact client SAN authorization, bounded message sizes/input, checked arithmetic, server-side unit and mTLS integration tests, a Qt action that invokes/cancels the sample client asynchronously with persisted non-secret settings, Linux CMake install rules/systemd unit, and an unsigned Windows development-bundle script. Not yet implemented: signed Windows installer/service, TLS 1.3 minimum enforcement verification, production certificate lifecycle, Linux package/update automation, production observability/resource isolation, CUDA/GPU workload, broad API interception, and full supported-OS CI results.
+Implemented in this slice: versioned protobuf schema, Windows gRPC client library/sample CLI, Linux gRPC mTLS server, exact client SAN authorization, bounded CPU and CUDA matrix workload APIs, CUDA 12.8/compute-capability-8.6 production build path, bounded single-request GPU use, server tests, mTLS integration tests, Qt workload UI, Linux CMake install rules/systemd unit, and unsigned Windows developer bundle. Not yet release-qualified: physical RTX 3060 execution, TLS 1.3 minimum enforcement, production certificate lifecycle, Linux signed packaging/update automation, health/metrics, multi-tenant resource isolation, independent security review, and full supported-OS CI results.

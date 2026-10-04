@@ -19,14 +19,15 @@ Accordingly, the roadmap begins with scope and protocol decisions rather than tr
 
 ## Implementation progress
 
-- **Scope/protocol decision:** Recorded the selected platform split, custom sample API boundary, gRPC/mTLS transport, and CPU-only first workload. Runtime tests showed gRPC exposes the DNS SAN value without the `DNS:` prefix; server identity configuration now uses that exact value.
+- **Scope/protocol decision:** Recorded the selected platform split, custom sample API boundary, and gRPC/mTLS transport. Runtime tests showed gRPC exposes the DNS SAN value without the `DNS:` prefix; server identity configuration now uses that exact value. The user selected GPU offload as a first-release requirement, a separate matrix-multiplication API while retaining sum-of-squares as a smoke test, and an RTX 3060/CUDA 12.8 initial qualification target.
 - **Vertical-slice source:** Added a shared v1 schema, Windows C++ client/sample CLI, Linux server, exact client-SAN authorization, bounded input and overflow checks, unit tests, and a disposable-certificate integration test.
+- **GPU vertical-slice work:** Added the bounded `RemoteMatrixMultiply` schema and client/server implementation, a CUDA 12.8 build path targeting compute capability 8.6, strict no-CPU-fallback behavior, startup GPU checks, and single-active-request admission control. Added the GUI action and systemd device allowlist. Hardware correctness/performance testing remains outstanding; CPU-only builds are developer/contract-test builds, not release artifacts.
 - **GUI/configuration:** Added per-user non-secret settings persistence, field/file validation, and asynchronous invocation/cancellation of the sample RPC client. The frontend is focused on the supported workload and in-session activity; mock connection states, random metrics, process-count placeholders, and nonfunctional diagnostics tabs have been removed. The GUI makes no persistent-session or telemetry claims.
 - **Linux operations:** Added a hardened systemd unit template and server deployment/operator guide, including dedicated-account and certificate-file guidance.
 - **Packaging foundation:** Added CMake install rules for the Linux server, operator docs and systemd unit, plus an unsigned Windows GUI/client bundling script that stages Qt and vcpkg runtime dependencies.
 - **Repository cleanup:** Removed tracked empty subsystem/build/test placeholders, the invalid empty mockup asset, and machine-specific Qt Creator configuration; filled the MIT license to match the README.
 - **Documentation/build:** Replaced conflicting protocol and architecture claims, populated the security model, added platform-specific build instructions, and removed the hardcoded Qt install path from CMake.
-- **Validation:** The Qt GUI builds with Qt 6.10/MinGW. Ubuntu 24.04 WSL successfully builds generated gRPC C++ client/server code; server unit tests and local mTLS interoperability tests pass (valid result, untrusted client CA, unauthorized client SAN, hostname mismatch, and overflow). The systemd unit syntax verifies against the built server and `cmake --install` stages executables/docs/unit. Windows CI builds and smoke-launches the gRPC CLI, and Ubuntu 22.04 builds/tests in CI, but those hosted jobs have not been run from this session. TLS 1.3 minimum enforcement remains a release gate. Windows service and full release stages are incomplete.
+- **Validation:** The Qt GUI builds with Qt 6.10/MinGW. Ubuntu 24.04 WSL CPU-only builds compile client/server and pass server unit tests plus mTLS integration, including explicit rejection of GPU work by a non-CUDA server. The current WSL host exposes an RTX 4050 6 GB with a CUDA-capable driver, but has no CUDA compiler/toolkit and does not match the approved RTX 3060 12 GB baseline; the CUDA kernel, GPU CTest, and target-device behavior remain unverified. systemd syntax validates with a temporary executable path, but NVIDIA device access still needs a real service-host test. Ubuntu 22.04 WSL is unavailable because its registered VHDX is missing; hosted Ubuntu 22.04 CI has not been observed. TLS 1.3 minimum enforcement remains a release gate. Windows service and full release stages are incomplete.
 
 ## Product and architecture constraints
 
@@ -40,17 +41,17 @@ Accordingly, the roadmap begins with scope and protocol decisions rather than tr
 ## Agreed MVP decisions
 
 - **Platforms:** Windows 10/11 x64 client; Ubuntu 22.04/24.04 x64 server.
-- **First workload:** a sample Windows application using one narrow, explicit custom API. The initial operation is a bounded batch sum-of-squares request. It demonstrates forwarding at that API boundary only; it does not intercept arbitrary third-party applications or operating-system calls.
+- **First workload:** retain bounded sum-of-squares as a CPU connectivity smoke test; provide GPU offload through a separate bounded matrix-multiplication API. It demonstrates forwarding at an explicit API boundary only; it does not intercept arbitrary third-party applications or operating-system calls.
 - **Transport:** gRPC over TLS, with TLS 1.3 as the production minimum.
 - **Enrollment:** administrator-provisioned client certificates and mutual TLS; no account/control service in the MVP.
-- **Server hardware assumption:** NVIDIA RTX 3060 12 GB is the initial intended server GPU. The sum-of-squares vertical slice is CPU-only; actual GPU execution is a subsequent workload adapter and must be separately validated.
+- **Server GPU baseline:** NVIDIA RTX 3060 12 GB, compute capability 8.6, CUDA Toolkit 12.8, compatible official driver, Ubuntu 22.04/24.04 x64. Physical-hardware qualification is a first-release blocker; GPU operation is not verified by the available CPU-only CI runners.
 
 ## Decisions still to resolve
 
 These choices affect the architecture and must be recorded in the relevant design documents before dependent implementation begins:
 
 - Which concrete Windows 10/11 releases and Ubuntu point releases/kernel versions are included in the support matrix?
-- Is GPU offload required for the first public release? If so, specify supported CUDA/toolkit/driver versions, device assignment, isolation, licensing, and workload semantics for the RTX 3060.
+- Define the qualified CUDA/driver maintenance policy, CUDA fault/recovery behavior, and numerical/performance release thresholds. The initial target is CUDA 12.8 GA with NVIDIA Linux driver >=570.26 and CUDA device 0; GPU sharing/isolation and performance targets are not yet established.
 - Which measured latency, throughput, availability, and resource-isolation targets are release gates?
 - Where may submitted workload data be stored, for how long, and how can the operator/client request its deletion?
 - What certificate issuance, rotation, revocation, and recovery procedures will operators use? The MVP assumes administrator-managed certificates but does not yet define their lifecycle.

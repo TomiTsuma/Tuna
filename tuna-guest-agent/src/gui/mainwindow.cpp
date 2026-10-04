@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QIntValidator>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
@@ -74,6 +75,7 @@ MainWindow::MainWindow(QWidget* parent)
                 if (error == QProcess::FailedToStart) {
                     requestTimeout_->stop();
                     runWorkloadButton_->setEnabled(true);
+                    runGpuWorkloadButton_->setEnabled(true);
                     cancelWorkloadButton_->setEnabled(false);
                     configureButton_->setEnabled(true);
                     statusLabel_->setText("Sample client could not be started");
@@ -103,6 +105,8 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         }
         requestCancelled_ = true;
         requestTimeout_->stop();
+        runWorkloadButton_->setEnabled(true);
+        runGpuWorkloadButton_->setEnabled(true);
         workloadProcess_->kill();
         workloadProcess_->waitForFinished(1000);
     }
@@ -165,6 +169,25 @@ QWidget* MainWindow::buildDashboard() {
     workloadInput_->setMaxLength(100000);
     workloadInput_->setAccessibleName("Workload values");
     workloadLayout->addWidget(workloadInput_);
+
+    auto* matrixDescription = new QLabel(
+        "GPU matrix multiplication (CUDA required, dimensions 128–512). "
+        "The request fails if a compatible server GPU is unavailable.",
+        workloadContent);
+    matrixDescription->setWordWrap(true);
+    workloadLayout->addWidget(matrixDescription);
+    auto* matrixControls = new QHBoxLayout();
+    matrixSizeInput_ = new QLineEdit("128", workloadContent);
+    matrixSizeInput_->setValidator(new QIntValidator(128, 512, matrixSizeInput_));
+    matrixSizeInput_->setMaximumWidth(120);
+    matrixSizeInput_->setAccessibleName("GPU matrix dimension");
+    matrixControls->addWidget(new QLabel("Square matrix dimension:", workloadContent));
+    matrixControls->addWidget(matrixSizeInput_);
+    matrixControls->addStretch();
+    runGpuWorkloadButton_ = new QPushButton("Run GPU workload", workloadContent);
+    connect(runGpuWorkloadButton_, &QPushButton::clicked, this, &MainWindow::onRunGpuWorkload);
+    matrixControls->addWidget(runGpuWorkloadButton_);
+    workloadLayout->addLayout(matrixControls);
 
     auto* actions = new QHBoxLayout();
     actions->addStretch();
@@ -337,6 +360,14 @@ bool MainWindow::saveSettings(const ClientSettings& settings) {
 }
 
 void MainWindow::onRunWorkload() {
+    startWorkload(false);
+}
+
+void MainWindow::onRunGpuWorkload() {
+    startWorkload(true);
+}
+
+void MainWindow::startWorkload(bool gpuWorkload) {
     if (workloadProcess_->state() != QProcess::NotRunning) {
         return;
     }
@@ -360,29 +391,42 @@ void MainWindow::onRunWorkload() {
         return;
     }
 
-    const QStringList inputParts = workloadInput_->text().split(',', Qt::KeepEmptyParts);
-    if (inputParts.isEmpty() || inputParts.size() > 4096) {
-        QMessageBox::warning(this, "Invalid workload",
-                             "Enter between 1 and 4096 unsigned integers separated by commas.");
-        return;
-    }
-
     QStringList arguments{
         "--server", settings_.serverHost + ":" + settings_.serverPort,
         "--ca", settings_.serverCaFile,
         "--cert", settings_.clientCertificateFile,
         "--key", settings_.clientPrivateKeyFile,
     };
-    for (const QString& part : inputParts) {
+    int inputCount = 0;
+    if (gpuWorkload) {
         bool valid = false;
-        const QString token = part.trimmed();
-        const qulonglong value = token.toULongLong(&valid);
-        if (token.isEmpty() || !valid) {
-            QMessageBox::warning(this, "Invalid workload",
-                                 "Every value must be an unsigned 64-bit decimal integer.");
+        const uint matrixSize = matrixSizeInput_->text().toUInt(&valid);
+        if (!valid || matrixSize < 128 || matrixSize > 512) {
+            QMessageBox::warning(this, "Invalid matrix size",
+                                 "Enter a matrix dimension from 128 to 512.");
             return;
         }
-        arguments.append(QString::number(value));
+        arguments << "--matrix-size" << QString::number(matrixSize);
+        inputCount = static_cast<int>(matrixSize * matrixSize);
+    } else {
+        const QStringList inputParts = workloadInput_->text().split(',', Qt::KeepEmptyParts);
+        if (inputParts.isEmpty() || inputParts.size() > 4096) {
+            QMessageBox::warning(this, "Invalid workload",
+                                 "Enter between 1 and 4096 unsigned integers separated by commas.");
+            return;
+        }
+        for (const QString& part : inputParts) {
+            bool valid = false;
+            const QString token = part.trimmed();
+            const qulonglong value = token.toULongLong(&valid);
+            if (token.isEmpty() || !valid) {
+                QMessageBox::warning(this, "Invalid workload",
+                                     "Every value must be an unsigned 64-bit decimal integer.");
+                return;
+            }
+            arguments.append(QString::number(value));
+        }
+        inputCount = inputParts.size();
     }
 
 #ifdef Q_OS_WIN
@@ -399,13 +443,17 @@ void MainWindow::onRunWorkload() {
 
     requestTimedOut_ = false;
     requestCancelled_ = false;
+    requestIsGpu_ = gpuWorkload;
     runWorkloadButton_->setEnabled(false);
+    runGpuWorkloadButton_->setEnabled(false);
     configureButton_->setEnabled(false);
     cancelWorkloadButton_->setEnabled(true);
     statusLabel_->setText("Sending request to the server...");
     resultLabel_->setText("Waiting for the remote result.");
-    appendActivity("Submitting sample workload (" + QString::number(inputParts.size()) +
-                   " values) to " + settings_.serverHost + ":" + settings_.serverPort + ".");
+    const QString workloadName = gpuWorkload ? "GPU matrix multiplication" : "sum of squares";
+    appendActivity("Submitting " + workloadName + " workload (" +
+                   QString::number(inputCount) + " input elements) to " +
+                   settings_.serverHost + ":" + settings_.serverPort + ".");
     workloadProcess_->setProgram(executable);
     workloadProcess_->setArguments(arguments);
     workloadProcess_->start();
@@ -415,6 +463,7 @@ void MainWindow::onRunWorkload() {
 void MainWindow::onWorkloadFinished(int exitCode, int exitStatus) {
     requestTimeout_->stop();
     runWorkloadButton_->setEnabled(true);
+    runGpuWorkloadButton_->setEnabled(true);
     configureButton_->setEnabled(true);
     cancelWorkloadButton_->setEnabled(false);
     const QString standardOutput = QString::fromLocal8Bit(workloadProcess_->readAllStandardOutput());
@@ -437,6 +486,26 @@ void MainWindow::onWorkloadFinished(int exitCode, int exitStatus) {
         resultLabel_->setText("The remote request failed. See Recent activity for the error.");
         const QString error = standardError.trimmed();
         appendActivity("Error: " + (error.isEmpty() ? "sample client exited unexpectedly." : error));
+        return;
+    }
+
+    if (requestIsGpu_) {
+        static const QRegularExpression gpuResultPattern(
+            R"(matrix_size=(\d+) result_checksum=([-+0-9.eE]+) result_0_0=([-+0-9.eE]+))");
+        const auto gpuMatch = gpuResultPattern.match(standardOutput);
+        if (!gpuMatch.hasMatch()) {
+            statusLabel_->setText("Invalid GPU-client response");
+            resultLabel_->setText("No valid result was returned. See Recent activity for details.");
+            appendActivity("Error: sample client returned no recognizable GPU result.");
+            return;
+        }
+        statusLabel_->setText("GPU request succeeded");
+        resultLabel_->setText("Remote " + gpuMatch.captured(1) + " × " +
+                              gpuMatch.captured(1) + " matrix; checksum " +
+                              gpuMatch.captured(2) + "; first value " +
+                              gpuMatch.captured(3) + ".");
+        appendActivity("GPU matrix multiplication succeeded at dimension " +
+                       gpuMatch.captured(1) + "; checksum=" + gpuMatch.captured(2) + ".");
         return;
     }
 

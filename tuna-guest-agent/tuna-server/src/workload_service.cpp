@@ -1,7 +1,10 @@
 #include "workload_service.h"
 
+#include "gpu_matrix.h"
+
 #include <cstdint>
 #include <cstddef>
+#include <cmath>
 #include <limits>
 #include <string>
 #include <utility>
@@ -10,6 +13,8 @@
 namespace {
 
 constexpr std::size_t kMaximumValues = 4096;
+constexpr std::uint32_t kMinimumMatrixSize = 128;
+constexpr std::uint32_t kMaximumMatrixSize = 512;
 constexpr std::uint32_t kProtocolVersion = 1;
 constexpr char kSanProperty[] = "x509_subject_alternative_name";
 
@@ -67,6 +72,34 @@ grpc::Status validate_request_metadata(std::uint32_t protocol_version,
     return grpc::Status::OK;
 }
 
+grpc::Status validate_matrix_request(const tuna::v1::RemoteMatrixMultiplyRequest& request) {
+    const std::uint32_t size = request.matrix_size();
+    if (size < kMinimumMatrixSize || size > kMaximumMatrixSize) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "matrix_size must be between 128 and 512"};
+    }
+    const std::size_t expected =
+        static_cast<std::size_t>(size) * static_cast<std::size_t>(size);
+    if (static_cast<std::size_t>(request.left_size()) != expected ||
+        static_cast<std::size_t>(request.right_size()) != expected) {
+        return {grpc::StatusCode::INVALID_ARGUMENT,
+                "left and right matrices must each contain matrix_size squared values"};
+    }
+    for (const float value : request.left()) {
+        if (!std::isfinite(value)) {
+            return {grpc::StatusCode::INVALID_ARGUMENT,
+                    "matrix values must be finite"};
+        }
+    }
+    for (const float value : request.right()) {
+        if (!std::isfinite(value)) {
+            return {grpc::StatusCode::INVALID_ARGUMENT,
+                    "matrix values must be finite"};
+        }
+    }
+    return grpc::Status::OK;
+}
+
 grpc::Status WorkloadService::RemoteSumOfSquares(
     grpc::ServerContext* context,
     const tuna::v1::RemoteSumOfSquaresRequest* request,
@@ -95,4 +128,53 @@ grpc::Status WorkloadService::RemoteSumOfSquares(
     response->set_request_id(request->request_id());
     response->set_result(result_value);
     return grpc::Status::OK;
+}
+
+grpc::Status WorkloadService::RemoteMatrixMultiply(
+    grpc::ServerContext* context,
+    const tuna::v1::RemoteMatrixMultiplyRequest* request,
+    tuna::v1::RemoteMatrixMultiplyResponse* response) {
+    if (!peer_has_allowed_san(context->auth_context(), allowed_client_san_)) {
+        return {grpc::StatusCode::PERMISSION_DENIED, "client certificate identity is not authorized"};
+    }
+    const grpc::Status metadata_status =
+        validate_request_metadata(request->protocol_version(), request->request_id());
+    if (!metadata_status.ok()) {
+        return metadata_status;
+    }
+    const grpc::Status validation_status = validate_matrix_request(*request);
+    if (!validation_status.ok()) {
+        return validation_status;
+    }
+#ifndef TUNA_ENABLE_CUDA
+    (void)response;
+    return {grpc::StatusCode::UNAVAILABLE,
+            "matrix multiplication requires a CUDA-enabled server build"};
+#else
+    if (gpu_request_active_.test_and_set(std::memory_order_acquire)) {
+        return {grpc::StatusCode::RESOURCE_EXHAUSTED,
+                "GPU is busy; retry the request later"};
+    }
+    struct GpuRequestGuard {
+        std::atomic_flag& active;
+        ~GpuRequestGuard() { active.clear(std::memory_order_release); }
+    } request_guard{gpu_request_active_};
+
+    std::vector<float> left(request->left().begin(), request->left().end());
+    std::vector<float> right(request->right().begin(), request->right().end());
+    std::vector<float> result;
+    std::string error;
+    if (!multiply_matrices_on_gpu(request->matrix_size(), left, right, &result, &error)) {
+        return {grpc::StatusCode::INTERNAL, "GPU matrix multiplication failed: " + error};
+    }
+
+    response->set_protocol_version(kProtocolVersion);
+    response->set_request_id(request->request_id());
+    response->set_matrix_size(request->matrix_size());
+    response->mutable_result()->Reserve(static_cast<int>(result.size()));
+    for (const float value : result) {
+        response->add_result(value);
+    }
+    return grpc::Status::OK;
+#endif
 }

@@ -2,7 +2,7 @@
 
 ## Scope and trust boundaries
 
-Tuna consists of a Windows 10/11 x64 client and an Ubuntu 22.04/24.04 x64 server. The first implementation forwards one bounded, deterministic custom API request over gRPC. It does not inject into arbitrary processes, intercept general Windows APIs, execute user-supplied code, proxy files, or offload GPU commands. The planned NVIDIA RTX 3060 is not used by the initial CPU-only sample workload.
+Tuna consists of a Windows 10/11 x64 client and an Ubuntu 22.04/24.04 x64 server. The API provides a bounded CPU connectivity smoke test and a bounded CUDA matrix-multiplication request. It does not inject into arbitrary processes, intercept general Windows APIs, execute user-supplied code, proxy files, or accept raw GPU command buffers.
 
 The trust boundaries are:
 
@@ -23,9 +23,9 @@ Treat all network requests as untrusted, even when they arrive over an authentic
 
 ## Request validation and resource limits
 
-- The initial API accepts only a versioned list of up to 4,096 unsigned 64-bit numbers. Reject unsupported protocol versions, empty request IDs, excess values, overflow, and malformed requests.
-- Client/server gRPC message limits are 64 KiB inbound and 1 KiB outbound; retain these limits or justify any increase against the versioned schema.
-- Apply RPC deadlines, concurrency/resource limits, and bounded memory use before exposing the service beyond development.
+- The sum-of-squares smoke test accepts at most 4,096 unsigned 64-bit values. The matrix API accepts only dimensions 128–512 and exactly two finite float32 square matrices. Reject unsupported versions, empty IDs, malformed lengths, and non-finite inputs/results.
+- Client/server gRPC message limits are 4 MiB to accommodate the bounded matrix input and result. Service-side validation also bounds dimensions and permits only one active GPU request; extra concurrent GPU work is rejected.
+- The CUDA build requires compute capability 8.6+ and uses GPU device 0 without a CPU fallback. The systemd unit grants only the selected NVIDIA device nodes, but device access and behavior need validation on real Ubuntu hosts and target hardware.
 - Do not persist request values or results on the server. Operational logs may include request IDs and outcome/duration, but not payload values, certificates, private keys, or other secrets.
 - No arbitrary command, executable, file path, pointer, process ID, or client memory reference is accepted or deserialized.
 
@@ -42,4 +42,4 @@ Treat all network requests as untrusted, even when they arrive over an authentic
 - TLS minimum-version enforcement and hostname-verification behavior need executable integration tests with the chosen gRPC/TLS dependency build.
 - Client identity allowlisting, certificate revocation/rotation, and key-protection procedures are not yet implemented.
 - Server concurrency quotas, service sandboxing, packaging, firewall guidance, signed Windows installer/update flow, and independent security review remain required.
-- No general syscall/GPU interception is implemented or represented as safe by this model.
+- No general syscall/GPU interception is implemented or represented as safe by this model. The explicit matrix API is the only GPU workload.

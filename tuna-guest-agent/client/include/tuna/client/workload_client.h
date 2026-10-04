@@ -25,6 +25,11 @@ public:
     grpc::Status remote_sum_of_squares(const std::string& request_id,
                                        const std::vector<std::uint64_t>& values,
                                        std::uint64_t* result) const;
+    grpc::Status remote_matrix_multiply(const std::string& request_id,
+                                        std::uint32_t matrix_size,
+                                        const std::vector<float>& left,
+                                        const std::vector<float>& right,
+                                        std::vector<float>* result) const;
 
 private:
     std::shared_ptr<grpc::Channel> channel_;

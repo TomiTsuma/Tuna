@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise a local server/client round trip using disposable mutual-TLS certificates."""
 
+import re
 import socket
 import subprocess
 import sys
@@ -63,9 +64,12 @@ def wait_for_listener(process, host, port):
 
 
 def main():
-    if len(sys.argv) != 4:
-        raise SystemExit("usage: test_mtls_round_trip.py SERVER CLIENT OPENSSL")
-    server_executable, client_executable, openssl = sys.argv[1:]
+    if len(sys.argv) not in (4, 5):
+        raise SystemExit("usage: test_mtls_round_trip.py SERVER CLIENT OPENSSL [--gpu-enabled]")
+    server_executable, client_executable, openssl = sys.argv[1:4]
+    gpu_enabled = len(sys.argv) == 5 and sys.argv[4] == "--gpu-enabled"
+    if len(sys.argv) == 5 and not gpu_enabled:
+        raise SystemExit("unknown test option")
 
     with tempfile.TemporaryDirectory(prefix="tuna-mtls-test-") as temporary:
         directory = Path(temporary)
@@ -133,6 +137,64 @@ def main():
             )
             if "sum_of_squares=25" not in valid.stdout:
                 raise RuntimeError(f"unexpected valid response: {valid.stdout}")
+
+            if gpu_enabled:
+                gpu = run(
+                    [
+                        client_executable, "--server", f"localhost:{port}",
+                        "--ca", str(ca_cert), "--cert", str(client_cert),
+                        "--key", str(client_key), "--matrix-size", "128",
+                    ],
+                    timeout=30,
+                )
+                match = re.search(
+                    r"matrix_size=128 result_checksum=([-+0-9.eE]+) "
+                    r"result_0_0=([-+0-9.eE]+)",
+                    gpu.stdout,
+                )
+                if not match:
+                    raise RuntimeError(f"unexpected GPU matrix response: {gpu.stdout}")
+
+                size = 128
+                left_column_sums = [
+                    sum((row + column) % 5 + 1 for row in range(size))
+                    for column in range(size)
+                ]
+                right_row_sums = [
+                    sum((row * 2 + column) % 7 + 1 for column in range(size))
+                    for row in range(size)
+                ]
+                expected_checksum = sum(
+                    left_column_sums[index] * right_row_sums[index]
+                    for index in range(size)
+                )
+                expected_first_value = sum(
+                    (index % 5 + 1) * (index * 2 % 7 + 1)
+                    for index in range(size)
+                )
+                if abs(float(match.group(1)) - expected_checksum) > 0.5:
+                    raise RuntimeError(
+                        f"unexpected GPU checksum {match.group(1)}, expected {expected_checksum}"
+                    )
+                if abs(float(match.group(2)) - expected_first_value) > 0.01:
+                    raise RuntimeError(
+                        f"unexpected first matrix value {match.group(2)}, "
+                        f"expected {expected_first_value}"
+                    )
+            else:
+                no_gpu = run(
+                    [
+                        client_executable, "--server", f"localhost:{port}",
+                        "--ca", str(ca_cert), "--cert", str(client_cert),
+                        "--key", str(client_key), "--matrix-size", "128",
+                    ],
+                    expected=1,
+                )
+                if "requires a CUDA-enabled server build" not in no_gpu.stderr:
+                    raise RuntimeError(
+                        "CPU-only server did not explicitly reject GPU work: "
+                        f"{no_gpu.stderr}"
+                    )
 
             unauthorized = run(
                 [

@@ -29,6 +29,8 @@ private:
     void appendActivity(const QString& message);
     bool configurationIsReady() const;
     void onRunWorkload();
+    void onRunGpuWorkload();
+    void startWorkload(bool gpuWorkload);
     void onWorkloadFinished(int exitCode, int exitStatus);
     bool saveSettings(const ClientSettings& settings);
     ClientSettings loadSettings() const;
@@ -40,13 +42,15 @@ private:
     QLabel* resultLabel_{};
     QPushButton* configureButton_{};
     QPushButton* runWorkloadButton_{};
+    QPushButton* runGpuWorkloadButton_{};
     QPushButton* cancelWorkloadButton_{};
     QLineEdit* workloadInput_{};
+    QLineEdit* matrixSizeInput_{};
     QTextEdit* logsText_{};
-    QLabel* tunnelStatusLabel_{};
     QProcess* workloadProcess_{};
     QTimer* requestTimeout_{};
     bool requestTimedOut_{};
     bool requestCancelled_{};
+    bool requestIsGpu_{};
     ClientSettings settings_;
 };

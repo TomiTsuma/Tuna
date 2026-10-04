@@ -40,6 +40,33 @@ int main() {
     if (!expect_status(grpc::StatusCode::INVALID_ARGUMENT,
                        calculate_sum_of_squares({1}, nullptr), "null result")) return 1;
 
+    tuna::v1::RemoteMatrixMultiplyRequest matrix_request;
+    matrix_request.set_protocol_version(1);
+    matrix_request.set_request_id("matrix-1");
+    matrix_request.set_matrix_size(128);
+    for (int index = 0; index < 128 * 128; ++index) {
+        matrix_request.add_left(1.0F);
+        matrix_request.add_right(2.0F);
+    }
+    if (!validate_matrix_request(matrix_request).ok()) {
+        std::cerr << "valid matrix request was rejected\n";
+        return 1;
+    }
+
+    matrix_request.set_matrix_size(127);
+    if (!expect_status(grpc::StatusCode::INVALID_ARGUMENT,
+                       validate_matrix_request(matrix_request), "matrix lower bound")) return 1;
+    matrix_request.set_matrix_size(513);
+    if (!expect_status(grpc::StatusCode::INVALID_ARGUMENT,
+                       validate_matrix_request(matrix_request), "matrix upper bound")) return 1;
+    matrix_request.set_matrix_size(128);
+    matrix_request.mutable_left()->RemoveLast();
+    if (!expect_status(grpc::StatusCode::INVALID_ARGUMENT,
+                       validate_matrix_request(matrix_request), "matrix element count")) return 1;
+    matrix_request.add_left(std::numeric_limits<float>::quiet_NaN());
+    if (!expect_status(grpc::StatusCode::INVALID_ARGUMENT,
+                       validate_matrix_request(matrix_request), "non-finite matrix value")) return 1;
+
     std::vector<std::uint64_t> too_many(4097, 1);
     if (!expect_status(grpc::StatusCode::INVALID_ARGUMENT,
                        calculate_sum_of_squares(too_many, &result), "batch limit")) return 1;
