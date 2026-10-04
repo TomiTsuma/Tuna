@@ -1,184 +1,37 @@
-# Tunneling Protocol Specification — Tuna Guest Agent
+# Tuna Client/Server RPC Contract
 
-## Overview
+## Status and scope
 
-The **Tuna Tunneling Protocol (TTP)** is the backbone of Tuna’s secure communication layer between the **Tuna Guest Agent (client)** and the **Tuna Remote (server)**. It enables the seamless transmission of intercepted system calls, GPU/CPU data streams, and I/O between the client’s local OS and the remote GPU-enabled environment.
+This is the authoritative transport decision for the first vertical slice: **gRPC over TLS with mutual certificate authentication**, using Protocol Buffers. It replaces the earlier speculative QUIC/TTP frame design for the MVP. The transport is an RPC channel; the custom application API is the only workload boundary supported initially.
 
-The protocol ensures:
+The API contains `RemoteSumOfSquares`, a bounded CPU connectivity smoke test, and `RemoteMatrixMultiply`, a bounded CUDA workload. The GPU RPC accepts two row-major float32 square matrices with dimensions 128–512 and returns their product. This is an explicit custom API, not a general compute-execution interface. The implementation does not intercept arbitrary Win32, graphics, filesystem, network, or third-party application APIs.
 
-* **End-to-end encryption**
-* **Low latency streaming**
-* **Adaptive compression**
-* **Cross-platform compatibility**
-* **Transparent OS integration**
+## Platform and identity
 
----
+- Client: Windows 10/11 x64.
+- Server: Ubuntu 22.04/24.04 x64. The first-release GPU baseline is an NVIDIA RTX 3060 12 GB (compute capability 8.6) with CUDA Toolkit 12.8 and a compatible NVIDIA driver. GPU workload verification must run on the target hardware; hosted CI currently does not include a GPU.
+- Both peers authenticate certificates issued by administrator-managed trust roots. The server requires and verifies a client certificate; the client verifies the server chain and hostname.
+- Production policy requires TLS 1.3 or newer. The gRPC credential setup must be tested against the actual gRPC/TLS build to prove that older protocol versions are rejected before release; capability to negotiate TLS 1.3 alone is not proof of a TLS 1.3 minimum.
+- Certificate issuance, rotation, revocation, and recovery are administrator responsibilities in the MVP and must be documented before production deployment.
 
-## 1. Protocol Stack
+## Contract and limits
 
-| Layer                 | Component                        | Purpose                                            |
-| --------------------- | -------------------------------- | -------------------------------------------------- |
-| **Application Layer** | Tuna Guest Agent / Tuna Remote   | Encodes intercepted syscalls and data frames       |
-| **Session Layer**     | TTP Session Manager              | Handles authentication, reconnection, multiplexing |
-| **Transport Layer**   | QUIC / gRPC over HTTP/3          | Provides reliable, low-latency transport           |
-| **Security Layer**    | TLS 1.3 with mutual certificates | Encryption, authentication, and key exchange       |
-| **Network Layer**     | UDP                              | Enables fast, multiplexed packet transmission      |
+The versioned schema lives in `protocol/tuna/v1/workload.proto`. The sum-of-squares request carries a protocol version, caller-generated request ID, and at most 4,096 values. The server rejects empty IDs, unsupported versions, oversized batches, and arithmetic overflow. The matrix request carries a protocol version, request ID, dimension, and exactly two `N×N` finite float32 matrices where `128 ≤ N ≤ 512`. The server computes on CUDA device 0, rejects simultaneous GPU submissions with `RESOURCE_EXHAUSTED`, and does not fall back to CPU. The response echoes the version, ID, and dimension with exactly `N×N` finite result values. Automatic retries are not enabled.
 
----
+The schema deliberately omits generic syscall payloads, arbitrary code, raw GPU command buffers, file access, remote process execution, compression, session resumption, and custom frame checksums. Client and server send/receive messages are capped at 4 MiB to accommodate the bounded matrix payload and response. Protobuf/gRPC framing and TLS provide transport encoding and confidentiality/integrity; application-level authorization and resource controls remain necessary.
 
-## 2. Connection Lifecycle
+## Connection/error behavior
 
-### 2.1 Initialization
+- Use a configured server DNS name and port; never disable certificate or hostname verification.
+- The client fails closed if the CA, client certificate, or private key is absent, unreadable, invalid, or mismatched.
+- RPC deadlines bound waiting time. A transport or server failure is surfaced as an error, not a locally computed success.
+- No server-side workload data is persisted. Logs must not include submitted values or private key material.
+- A valid client certificate chains to the configured client CA. Production deployments must use a dedicated client CA or add a documented identity allowlist; trust of a general-purpose CA is not sufficient authorization.
 
-1. **Handshake Initiation:**
-   The client (Guest Agent) sends a **ClientHello** packet over QUIC.
-2. **Certificate Exchange:**
-   Mutual authentication is performed using TLS 1.3 certificates.
-3. **Session Negotiation:**
-   Client and server negotiate compression level, encryption cipher, and session ID.
-4. **Tunnel Establishment:**
-   A persistent QUIC channel is created for the session.
+## Compatibility policy
 
-### 2.2 Active Tunnel
+The protobuf package path includes the major version (`tuna.v1`). Additive optional fields are compatible within v1. Changes to semantics, required fields, units, or result interpretation require a new major package/service version. Client and server build/test jobs must compile the same checked-in schema and exercise shared conformance cases.
 
-Once established, the tunnel operates in full duplex mode. Each data frame is tagged with:
+## Production gates
 
-* **Frame Type:** `SYS`, `GPU`, `IO`, `HEARTBEAT`, `CONTROL`
-* **Frame ID:** Sequential counter for tracking
-* **Timestamp:** Synchronization aid
-* **Payload:** Encrypted content blob
-
-### 2.3 Termination
-
-* Either side sends a **FIN** control frame.
-* Session data flushed, keys discarded.
-* QUIC session teardown follows.
-
----
-
-## 3. Data Frame Structure
-
-```
-┌───────────────────────────┐
-│ Frame Header              │
-│  - Frame Type (1 byte)    │
-│  - Frame ID (4 bytes)     │
-│  - Payload Length (4 bytes)│
-│  - Timestamp (8 bytes)    │
-└───────────────────────────┘
-┌───────────────────────────┐
-│ Encrypted Payload          │
-│ (Variable Length)          │
-└───────────────────────────┘
-```
-
-### Frame Types
-
-| Type        | Purpose                                       |
-| ----------- | --------------------------------------------- |
-| `SYS`       | Serialized system call metadata and arguments |
-| `GPU`       | GPU command buffers, CUDA kernel invocations  |
-| `IO`        | File/network I/O redirections                 |
-| `HEARTBEAT` | Health check and latency measurement          |
-| `CONTROL`   | Configuration, logs, and diagnostics          |
-
----
-
-## 4. Security Architecture
-
-### 4.1 Authentication
-
-* **Mutual TLS (mTLS):**
-  Both client and server present certificates signed by a common CA.
-* **Device Binding:**
-  Each client certificate is tied to a specific hardware fingerprint (TPM hash).
-
-### 4.2 Encryption
-
-* **TLS 1.3 AES-256-GCM** for payload encryption.
-* **Ephemeral ECDH keys** for forward secrecy.
-* **Nonce rotation** every 10 minutes or after 100MB transferred.
-
-### 4.3 Integrity & Replay Protection
-
-* Frame-level **SHA-256 checksums**.
-* **Monotonic frame IDs** prevent replay or out-of-order injection.
-
----
-
-## 5. Multiplexing & Channel Management
-
-Each tunnel supports multiple **logical channels** for different purposes:
-
-* `chan_sys`: System calls
-* `chan_gpu`: GPU data streams
-* `chan_io`: File and socket operations
-* `chan_ctrl`: Control and monitoring
-
-Each channel is multiplexed using QUIC streams, enabling parallel, low-latency operations.
-
----
-
-## 6. Compression & Optimization
-
-| Feature                 | Description                                                         |
-| ----------------------- | ------------------------------------------------------------------- |
-| **Zstandard (Zstd)**    | Default compression for high-throughput syscalls                    |
-| **GPU Stream Batching** | Aggregates multiple small GPU calls into one large buffer           |
-| **Delta Encoding**      | For repeated syscall sequences                                      |
-| **Zero-Copy Buffering** | Avoids redundant memory copying between user-space and kernel-space |
-
----
-
-## 7. Keep-Alive & Reconnection
-
-* **Heartbeat Frames:** Sent every 3s with round-trip time (RTT) data.
-* **Timeout:** 10s with exponential backoff for reconnection attempts.
-* **Resume Tokens:** Sessions can resume from the last acknowledged frame ID after disconnection.
-
----
-
-## 8. Implementation Notes
-
-### Client Side (Guest Agent)
-
-* Uses an embedded QUIC client library (e.g., `msquic` or `aioquic`).
-* Manages syscall interception hooks and streams data frames through TTP.
-* Includes local buffer queues to prevent blocking.
-
-### Server Side (Tuna Remote)
-
-* QUIC listener accepts multiple client tunnels.
-* Decodes incoming frames, routes them to hypervisor or GPU daemon.
-* Sends responses (e.g., syscall return values) through the same channel.
-
----
-
-## 9. Development Stack
-
-| Component     | Recommendation                       |
-| ------------- | ------------------------------------ |
-| QUIC Library  | `aioquic` (Python) or `msquic` (C++) |
-| Encryption    | OpenSSL / Rustls                     |
-| Serialization | FlatBuffers / Protobuf               |
-| Compression   | Zstandard                            |
-| Monitoring    | Prometheus + Grafana                 |
-| Logging       | Structured JSON logs via Fluent Bit  |
-
----
-
-## 10. Developer Checklist
-
-* [ ] Define protobuf schemas for all frame types
-* [ ] Implement handshake & certificate exchange
-* [ ] Implement frame serialization/deserialization
-* [ ] Add compression + encryption pipeline
-* [ ] Integrate syscall hook streams with tunnel sender
-* [ ] Test reconnection, heartbeat, and session resumption
-* [ ] Perform performance benchmarking (latency, throughput)
-* [ ] Add logging and metrics endpoints
-* [ ] Conduct full security audit before deployment
-
----
-
-**End of Document**
+Before release, add tests proving TLS 1.3 minimum enforcement, hostname validation, client-certificate rejection, authorization policy, deadlines, bounded input, arithmetic overflow handling, and behavior across server restart/network loss. Add measured latency/throughput targets when the workload and deployment environment are finalized.

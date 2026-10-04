@@ -1,300 +1,525 @@
 #include "mainwindow.h"
 
-#include <QTabWidget>
-#include <QWidget>
-#include <QVBoxLayout>
-#include <QHBoxLayout>
-#include <QGridLayout>
-#include <QLabel>
-#include <QProgressBar>
-#include <QPushButton>
-#include <QFrame>
-#include <QTimer>
-#include <QTime>
-#include <QMenuBar>
-#include <QMenu>
 #include <QAction>
-#include <QSystemTrayIcon>
-#include <QIcon>
+#include <QCloseEvent>
+#include <QDateTime>
+#include <QFont>
+#include <QFileInfo>
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QIntValidator>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMenu>
+#include <QMenuBar>
+#include <QMessageBox>
+#include <QProcess>
+#include <QPushButton>
+#include <QRegularExpression>
+#include <QSettings>
+#include <QTabWidget>
+#include <QTextDocument>
 #include <QTextEdit>
-#include <QTableWidget>
-#include <QHeaderView>
-#include <QRandomGenerator>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <QCoreApplication>
+#include <QStringList>
 
 namespace {
-QLabel* makeTitle(const QString& text) {
-    auto* l = new QLabel(text);
-    QFont f = l->font();
-    f.setPointSizeF(f.pointSizeF() + 6);
-    f.setBold(true);
-    l->setFont(f);
-    return l;
+
+QLabel* makeTitle(const QString& text, QWidget* parent = nullptr) {
+    auto* label = new QLabel(text, parent);
+    QFont font = label->font();
+    font.setPointSizeF(font.pointSizeF() + 6);
+    font.setBold(true);
+    label->setFont(font);
+    return label;
 }
 
-QFrame* card(QWidget* content, QWidget* parent = nullptr) {
-    auto* c = new QFrame(parent);
-    c->setObjectName("Card");
-    auto* lay = new QVBoxLayout(c);
-    lay->setContentsMargins(16,16,16,16);
-    lay->addWidget(content);
-    return c;
-}
+QWidget* makeCard(QWidget* content, QWidget* parent = nullptr) {
+    auto* frame = new QFrame(parent);
+    frame->setObjectName("Card");
+    auto* layout = new QVBoxLayout(frame);
+    layout->setContentsMargins(20, 18, 20, 18);
+    layout->addWidget(content);
+    return frame;
 }
 
-MainWindow::MainWindow(QWidget *parent)
+}
+
+MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent) {
-    auto* tabs = new QTabWidget(this);
-    tabs->addTab(buildDashboard(), "Dashboard");
-    tabs->addTab(buildPerformance(), "Performance");
-    tabs->addTab(buildProcesses(), "Processes");
-    tabs->addTab(buildTunnel(), "Tunnel");
-    tabs->addTab(buildLogs(), "Logs");
-    setCentralWidget(tabs);
-    resize(1180, 760);
+    setWindowTitle("Tuna Client");
+    setMinimumSize(700, 520);
+    resize(900, 660);
 
+    settings_ = loadSettings();
+    workloadProcess_ = new QProcess(this);
+    requestTimeout_ = new QTimer(this);
+    requestTimeout_->setSingleShot(true);
+    connect(requestTimeout_, &QTimer::timeout, this, [this]() {
+        if (workloadProcess_->state() == QProcess::Running) {
+            requestTimedOut_ = true;
+            workloadProcess_->kill();
+        }
+    });
+    connect(workloadProcess_,
+            qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+            this,
+            [this](int exitCode, QProcess::ExitStatus exitStatus) {
+                onWorkloadFinished(exitCode, static_cast<int>(exitStatus));
+            });
+    connect(workloadProcess_, &QProcess::errorOccurred, this,
+            [this](QProcess::ProcessError error) {
+                if (error == QProcess::FailedToStart) {
+                    requestTimeout_->stop();
+                    runWorkloadButton_->setEnabled(true);
+                    runGpuWorkloadButton_->setEnabled(true);
+                    cancelWorkloadButton_->setEnabled(false);
+                    configureButton_->setEnabled(true);
+                    statusLabel_->setText("Sample client could not be started");
+                    resultLabel_->setText("The sample client was not found or could not start.");
+                    appendActivity("Error: tuna_sample_app could not be started.");
+                }
+            });
+
+    auto* tabs = new QTabWidget(this);
+    tabs->addTab(buildDashboard(), "Workload");
+    tabs->addTab(buildActivity(), "Activity");
+    setCentralWidget(tabs);
+
+    updateConfigurationDisplay();
     buildMenus();
-    buildTray();
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    if (workloadProcess_->state() == QProcess::Running) {
+        const auto answer = QMessageBox::question(
+            this, "Request in progress",
+            "Exiting will cancel the local client. The server may already have completed the request. Exit anyway?",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (answer != QMessageBox::Yes) {
+            event->ignore();
+            return;
+        }
+        requestCancelled_ = true;
+        requestTimeout_->stop();
+        runWorkloadButton_->setEnabled(true);
+        runGpuWorkloadButton_->setEnabled(true);
+        workloadProcess_->kill();
+        workloadProcess_->waitForFinished(1000);
+    }
+    QMainWindow::closeEvent(event);
 }
 
 QWidget* MainWindow::buildDashboard() {
     auto* root = new QWidget(this);
-    auto* v = new QVBoxLayout(root);
-    v->setContentsMargins(16,16,16,16);
-    v->setSpacing(16);
+    auto* layout = new QVBoxLayout(root);
+    layout->setContentsMargins(24, 24, 24, 24);
+    layout->setSpacing(18);
 
-    // Header card
-    auto* header = new QWidget(root);
-    auto* headerLayout = new QGridLayout(header);
-    headerLayout->setContentsMargins(12,12,12,12);
-    headerLayout->setHorizontalSpacing(24);
-    headerLayout->setVerticalSpacing(8);
+    auto* intro = new QWidget(root);
+    auto* introLayout = new QVBoxLayout(intro);
+    introLayout->setContentsMargins(0, 0, 0, 0);
+    introLayout->setSpacing(6);
+    introLayout->addWidget(makeTitle("Tuna Client", intro));
+    auto* subtitle = new QLabel(
+        "Send the supported sample workload to a configured Tuna server.", intro);
+    subtitle->setWordWrap(true);
+    introLayout->addWidget(subtitle);
+    layout->addWidget(intro);
 
-    statusLabel_ = makeTitle("Connected to Tuna Server");
-    statusLabel_->setProperty("accent", true);
-    serverLabel_ = new QLabel("server-us-west-2.tuna.cloud");
-    uptimeLabel_ = new QLabel("Uptime\n2h 34m");
-    tlsLabel_ = new QLabel("Encryption\nTLS 1.3");
-    protocolLabel_ = new QLabel("Protocol\nQUIC/HTTP3");
-    disconnectButton_ = new QPushButton("Disconnect");
-    disconnectButton_->setMinimumWidth(140);
-    connect(disconnectButton_, &QPushButton::clicked, this, &MainWindow::onToggleConnection);
+    auto* connectionContent = new QWidget(root);
+    auto* connectionLayout = new QHBoxLayout(connectionContent);
+    connectionLayout->setContentsMargins(0, 0, 0, 0);
+    auto* connectionInfo = new QVBoxLayout();
+    auto* connectionTitle = new QLabel("Server configuration", connectionContent);
+    QFont headingFont = connectionTitle->font();
+    headingFont.setBold(true);
+    connectionTitle->setFont(headingFont);
+    connectionInfo->addWidget(connectionTitle);
+    serverLabel_ = new QLabel(connectionContent);
+    securityLabel_ = new QLabel(connectionContent);
+    securityLabel_->setWordWrap(true);
+    connectionInfo->addWidget(serverLabel_);
+    connectionInfo->addWidget(securityLabel_);
+    connectionLayout->addLayout(connectionInfo, 1);
+    configureButton_ = new QPushButton("Configure...", connectionContent);
+    connect(configureButton_, &QPushButton::clicked, this, &MainWindow::openSettings);
+    connectionLayout->addWidget(configureButton_);
+    layout->addWidget(makeCard(connectionContent, root));
 
-    headerLayout->addWidget(statusLabel_, 0, 0, 1, 3);
-    headerLayout->addWidget(serverLabel_, 1, 0, 1, 3);
-    headerLayout->addWidget(uptimeLabel_, 2, 0);
-    headerLayout->addWidget(tlsLabel_, 2, 1);
-    headerLayout->addWidget(protocolLabel_, 2, 2);
-    headerLayout->addWidget(disconnectButton_, 1, 4, 2, 1);
+    auto* workloadContent = new QWidget(root);
+    auto* workloadLayout = new QVBoxLayout(workloadContent);
+    workloadLayout->setContentsMargins(0, 0, 0, 0);
+    workloadLayout->setSpacing(12);
+    auto* workloadTitle = new QLabel("Sum of squares", workloadContent);
+    workloadTitle->setFont(headingFont);
+    workloadLayout->addWidget(workloadTitle);
 
-    v->addWidget(card(header));
+    auto* explanation = new QLabel(
+        "Enter 1–4096 unsigned 64-bit integers. The server returns the sum of their squares.",
+        workloadContent);
+    explanation->setWordWrap(true);
+    workloadLayout->addWidget(explanation);
 
-    // Metrics row
-    auto* row = new QHBoxLayout();
-    row->setSpacing(16);
+    workloadInput_ = new QLineEdit(workloadContent);
+    workloadInput_->setPlaceholderText("For example: 3, 4, 10");
+    workloadInput_->setMaxLength(100000);
+    workloadInput_->setAccessibleName("Workload values");
+    workloadLayout->addWidget(workloadInput_);
 
-    auto* cpuBox = new QWidget(root);
-    auto* cpuLay = new QVBoxLayout(cpuBox);
-    cpuLay->addWidget(new QLabel("CPU Offload"));
-    cpuBar_ = new QProgressBar(cpuBox);
-    cpuBar_->setRange(0, 100);
-    cpuBar_->setValue(87);
-    cpuLay->addWidget(cpuBar_);
+    auto* matrixDescription = new QLabel(
+        "GPU matrix multiplication (CUDA required, dimensions 128–512). "
+        "The request fails if a compatible server GPU is unavailable.",
+        workloadContent);
+    matrixDescription->setWordWrap(true);
+    workloadLayout->addWidget(matrixDescription);
+    auto* matrixControls = new QHBoxLayout();
+    matrixSizeInput_ = new QLineEdit("128", workloadContent);
+    matrixSizeInput_->setValidator(new QIntValidator(128, 512, matrixSizeInput_));
+    matrixSizeInput_->setMaximumWidth(120);
+    matrixSizeInput_->setAccessibleName("GPU matrix dimension");
+    matrixControls->addWidget(new QLabel("Square matrix dimension:", workloadContent));
+    matrixControls->addWidget(matrixSizeInput_);
+    matrixControls->addStretch();
+    runGpuWorkloadButton_ = new QPushButton("Run GPU workload", workloadContent);
+    connect(runGpuWorkloadButton_, &QPushButton::clicked, this, &MainWindow::onRunGpuWorkload);
+    matrixControls->addWidget(runGpuWorkloadButton_);
+    workloadLayout->addLayout(matrixControls);
 
-    auto* gpuBox = new QWidget(root);
-    auto* gpuLay = new QVBoxLayout(gpuBox);
-    gpuLay->addWidget(new QLabel("GPU Usage"));
-    gpuBar_ = new QProgressBar(gpuBox);
-    gpuBar_->setRange(0, 100);
-    gpuBar_->setValue(92);
-    gpuLay->addWidget(gpuBar_);
-
-    auto* latBox = new QWidget(root);
-    auto* latLay = new QVBoxLayout(latBox);
-    latLay->addWidget(new QLabel("Tunnel Latency"));
-    latencyBar_ = new QProgressBar(latBox);
-    latencyBar_->setRange(0, 200);
-    latencyBar_->setValue(12);
-    latLay->addWidget(latencyBar_);
-
-    row->addWidget(card(cpuBox));
-    row->addWidget(card(gpuBox));
-    row->addWidget(card(latBox));
-
-    auto* rowWrap = new QWidget(root);
-    rowWrap->setLayout(row);
-    v->addWidget(rowWrap);
-
-    // Simulated updates
-    auto* timer = new QTimer(root);
-    connect(timer, &QTimer::timeout, this, [this]() {
-        cpuBar_->setValue((cpuBar_->value() + 3) % 100);
-        gpuBar_->setValue((gpuBar_->value() + 5) % 100);
-        int next = (latencyBar_->value() + 7) % 200;
-        latencyBar_->setValue(next);
+    auto* actions = new QHBoxLayout();
+    actions->addStretch();
+    cancelWorkloadButton_ = new QPushButton("Cancel request", workloadContent);
+    cancelWorkloadButton_->setEnabled(false);
+    connect(cancelWorkloadButton_, &QPushButton::clicked, this, [this]() {
+        if (workloadProcess_->state() == QProcess::Running) {
+            requestCancelled_ = true;
+            workloadProcess_->kill();
+        }
     });
-    timer->start(3000);
+    actions->addWidget(cancelWorkloadButton_);
+    runWorkloadButton_ = new QPushButton("Run on server", workloadContent);
+    runWorkloadButton_->setDefault(true);
+    connect(runWorkloadButton_, &QPushButton::clicked, this, &MainWindow::onRunWorkload);
+    actions->addWidget(runWorkloadButton_);
+    workloadLayout->addLayout(actions);
 
+    statusLabel_ = new QLabel("Configure a server to begin.", workloadContent);
+    statusLabel_->setObjectName("RequestStatus");
+    statusLabel_->setProperty("accent", true);
+    statusLabel_->setWordWrap(true);
+    workloadLayout->addWidget(statusLabel_);
+    resultLabel_ = new QLabel("No request has been submitted.", workloadContent);
+    resultLabel_->setObjectName("WorkloadResult");
+    resultLabel_->setWordWrap(true);
+    workloadLayout->addWidget(resultLabel_);
+    layout->addWidget(makeCard(workloadContent, root));
+    layout->addStretch();
     return root;
 }
 
-QWidget* MainWindow::buildPerformance() {
-    auto* w = new QWidget(this);
-    auto* l = new QVBoxLayout(w);
-    auto* title = makeTitle("Live Metrics");
-    l->addWidget(title);
-    auto* table = new QTableWidget(0, 3, w);
-    table->setHorizontalHeaderLabels({"Metric", "Current", "Trend"});
-    table->horizontalHeader()->setStretchLastSection(true);
-    l->addWidget(table);
+QWidget* MainWindow::buildActivity() {
+    auto* page = new QWidget(this);
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(24, 24, 24, 24);
+    layout->setSpacing(12);
 
-    auto addRow = [table](const QString& name) {
-        int r = table->rowCount();
-        table->insertRow(r);
-        table->setItem(r, 0, new QTableWidgetItem(name));
-        table->setItem(r, 1, new QTableWidgetItem("0"));
-        table->setItem(r, 2, new QTableWidgetItem("↗"));
-    };
-    addRow("CPU Offload %");
-    addRow("GPU Util %");
-    addRow("Tunnel RTT ms");
-    addRow("Throughput MB/s");
-
-    auto* timer = new QTimer(w);
-    connect(timer, &QTimer::timeout, this, [table]() {
-        for (int r = 0; r < table->rowCount(); ++r) {
-            int val = QRandomGenerator::global()->bounded(1, 100);
-            table->item(r, 1)->setText(QString::number(val));
-            table->item(r, 2)->setText(val % 2 ? "↗" : "↘");
-        }
+    auto* header = new QHBoxLayout();
+    header->addWidget(makeTitle("Recent activity", page));
+    header->addStretch();
+    auto* clearButton = new QPushButton("Clear", page);
+    connect(clearButton, &QPushButton::clicked, this, [this]() {
+        logsText_->clear();
     });
-    timer->start(2000);
-    return w;
-}
+    header->addWidget(clearButton);
+    layout->addLayout(header);
 
-QWidget* MainWindow::buildProcesses() {
-    auto* w = new QWidget(this);
-    auto* l = new QVBoxLayout(w);
-    l->addWidget(makeTitle("Hooked Processes"));
-    auto* table = new QTableWidget(0, 4, w);
-    table->setHorizontalHeaderLabels({"Process", "PID", "Hooks", "Status"});
-    table->horizontalHeader()->setStretchLastSection(true);
-    l->addWidget(table);
-
-    auto addProc = [table](const QString& name, int pid, const QString& hooks, const QString& status) {
-        int r = table->rowCount();
-        table->insertRow(r);
-        table->setItem(r, 0, new QTableWidgetItem(name));
-        table->setItem(r, 1, new QTableWidgetItem(QString::number(pid)));
-        table->setItem(r, 2, new QTableWidgetItem(hooks));
-        table->setItem(r, 3, new QTableWidgetItem(status));
-    };
-    addProc("Photoshop.exe", 1234, "D3D11, FileIO", "Active");
-    addProc("Blender.exe", 5678, "CUDA, FileIO", "Active");
-    addProc("python.exe", 9012, "OpenCL, FileIO", "Idle");
-    return w;
-}
-
-QWidget* MainWindow::buildTunnel() {
-    auto* w = new QWidget(this);
-    auto* l = new QVBoxLayout(w);
-    l->addWidget(makeTitle("Tunnel Diagnostics"));
-    auto* grid = new QGridLayout();
-    l->addLayout(grid);
-
-    grid->addWidget(new QLabel("Protocol:"), 0, 0);
-    grid->addWidget(new QLabel("QUIC/HTTP3"), 0, 1);
-    grid->addWidget(new QLabel("Cipher:"), 1, 0);
-    grid->addWidget(new QLabel("TLS 1.3 AES-256-GCM"), 1, 1);
-    grid->addWidget(new QLabel("Heartbeat:"), 2, 0);
-    grid->addWidget(new QLabel("OK (3s)"), 2, 1);
-    grid->addWidget(new QLabel("Session ID:"), 3, 0);
-    grid->addWidget(new QLabel("abcd-1234"), 3, 1);
-
-    auto* btnRow = new QHBoxLayout();
-    auto* reconnect = new QPushButton("Reconnect");
-    auto* safeMode = new QPushButton("Enable Safe Mode");
-    btnRow->addWidget(reconnect);
-    btnRow->addWidget(safeMode);
-    btnRow->addStretch();
-    l->addLayout(btnRow);
-    return w;
-}
-
-QWidget* MainWindow::buildLogs() {
-    auto* w = new QWidget(this);
-    auto* l = new QVBoxLayout(w);
-    l->addWidget(makeTitle("Agent Logs"));
-    auto* text = new QTextEdit(w);
-    text->setReadOnly(true);
-    l->addWidget(text);
-
-    auto* timer = new QTimer(w);
-    connect(timer, &QTimer::timeout, this, [text]() {
-        static int n = 0;
-        text->append(QString("[%1] Tunnel heartbeat OK, RTT=%2ms")
-                     .arg(QTime::currentTime().toString())
-                     .arg(QRandomGenerator::global()->bounded(5, 60)));
-        if (++n % 5 == 0) {
-            text->append("Info: Hooks healthy; GPU path zero-copy active");
-        }
-    });
-    timer->start(1500);
-    return w;
+    auto* note = new QLabel(
+        "Activity from this GUI session only. It is not a persistent service or server log.",
+        page);
+    note->setWordWrap(true);
+    layout->addWidget(note);
+    logsText_ = new QTextEdit(page);
+    logsText_->setReadOnly(true);
+    logsText_->document()->setMaximumBlockCount(1000);
+    logsText_->setPlaceholderText("Request activity will appear here.");
+    layout->addWidget(logsText_, 1);
+    return page;
 }
 
 void MainWindow::buildMenus() {
-    auto* file = menuBar()->addMenu("File");
-    auto* actSettings = file->addAction("Settings...");
-    auto* actExit = file->addAction("Exit");
-    auto* conn = menuBar()->addMenu("Connection");
-    auto* actToggle = conn->addAction("Disconnect");
-    auto* view = menuBar()->addMenu("View");
-    auto* actLogs = view->addAction("Logs");
+    auto* fileMenu = menuBar()->addMenu("File");
+    auto* settingsAction = fileMenu->addAction("Connection settings...");
+    fileMenu->addSeparator();
+    auto* exitAction = fileMenu->addAction("Exit");
+    connect(settingsAction, &QAction::triggered, this, &MainWindow::openSettings);
+    connect(exitAction, &QAction::triggered, this, &QWidget::close);
 
-    connect(actExit, &QAction::triggered, this, [this]() { close(); });
-    connect(actToggle, &QAction::triggered, this, [this, actToggle]() {
-        onToggleConnection();
-        actToggle->setText(connected_ ? "Disconnect" : "Connect");
-    });
-    connect(actLogs, &QAction::triggered, this, [this]() {
-        // Switch to Logs tab
-        auto* tabs = findChild<QTabWidget*>();
-        if (tabs) tabs->setCurrentIndex(4);
-    });
+    auto* workloadMenu = menuBar()->addMenu("Workload");
+    auto* runAction = workloadMenu->addAction("Run sample workload");
+    connect(runAction, &QAction::triggered, this, &MainWindow::onRunWorkload);
 
-    connect(actSettings, &QAction::triggered, this, [this]() {
-        // Lazy include to avoid header coupling
-        extern void openSettingsDialog(QWidget* parent);
-        openSettingsDialog(this);
+    auto* viewMenu = menuBar()->addMenu("View");
+    auto* activityAction = viewMenu->addAction("Recent activity");
+    connect(activityAction, &QAction::triggered, this, [this]() {
+        if (auto* tabs = findChild<QTabWidget*>()) {
+            tabs->setCurrentIndex(1);
+        }
     });
 }
 
-void MainWindow::buildTray() {
-    tray_ = new QSystemTrayIcon(QIcon(), this);
-    tray_->setToolTip("Tuna Guest Agent");
-    auto* menu = new QMenu(this);
-    auto* actOpen = menu->addAction("Open");
-    auto* actToggle = menu->addAction("Disconnect");
-    auto* actQuit = menu->addAction("Exit");
-    connect(actOpen, &QAction::triggered, this, [this]() { showNormal(); activateWindow(); });
-    connect(actToggle, &QAction::triggered, this, [this, actToggle]() {
-        onToggleConnection();
-        actToggle->setText(connected_ ? "Disconnect" : "Connect");
-    });
-    connect(actQuit, &QAction::triggered, this, [this]() { close(); });
-    tray_->setContextMenu(menu);
-    tray_->show();
-}
-
-void MainWindow::onToggleConnection() {
-    connected_ = !connected_;
-    if (connected_) {
-        statusLabel_->setText("Connected to Tuna Server");
-        disconnectButton_->setText("Disconnect");
-    } else {
-        statusLabel_->setText("Disconnected");
-        disconnectButton_->setText("Connect");
+void MainWindow::openSettings() {
+    if (workloadProcess_->state() != QProcess::NotRunning) {
+        QMessageBox::information(this, "Request in progress",
+                                 "Wait for or cancel the current request before changing its connection settings.");
+        return;
     }
+    ClientSettings edited = settings_;
+    if (!openSettingsDialog(this, &edited)) {
+        return;
+    }
+    if (!saveSettings(edited)) {
+        return;
+    }
+    settings_ = edited;
+    updateConfigurationDisplay();
+    resultLabel_->setText("No request has been submitted with this configuration.");
+    appendActivity("Connection settings saved for " + settings_.serverHost + ":" +
+                   settings_.serverPort + ".");
 }
 
+void MainWindow::updateConfigurationDisplay() {
+    if (settings_.serverHost.isEmpty()) {
+        serverLabel_->setText("No server configured.");
+        securityLabel_->setText("A server and administrator-provisioned mTLS credentials are required.");
+        statusLabel_->setText("Configure a server to begin.");
+        return;
+    }
+    serverLabel_->setText("Target: " + settings_.serverHost + ":" + settings_.serverPort);
+    if (!configurationIsReady()) {
+        securityLabel_->setText("Connection setup is incomplete or a credential file is unavailable. Review settings.");
+        statusLabel_->setText("Connection settings need attention.");
+        return;
+    }
+    securityLabel_->setText("Each request uses gRPC over mutual TLS. No persistent session is maintained.");
+    statusLabel_->setText("Ready to submit a request; no persistent connection is open.");
+}
 
+bool MainWindow::configurationIsReady() const {
+    bool portValid = false;
+    const uint port = settings_.serverPort.toUInt(&portValid);
+    if (settings_.serverHost.isEmpty() || !portValid || port == 0 || port > 65535) {
+        return false;
+    }
+    const QStringList credentialPaths{
+        settings_.serverCaFile,
+        settings_.clientCertificateFile,
+        settings_.clientPrivateKeyFile,
+    };
+    for (const QString& path : credentialPaths) {
+        const QFileInfo info(path);
+        if (!info.isFile() || !info.isReadable()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void MainWindow::appendActivity(const QString& message) {
+    logsText_->append("[" + QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss") +
+                      "] " + message.toHtmlEscaped());
+}
+
+ClientSettings MainWindow::loadSettings() const {
+    QSettings values;
+    return {
+        values.value("connection/serverHost").toString(),
+        values.value("connection/serverPort", "50051").toString(),
+        values.value("tls/serverCaFile").toString(),
+        values.value("tls/clientCertificateFile").toString(),
+        values.value("tls/clientPrivateKeyFile").toString(),
+    };
+}
+
+bool MainWindow::saveSettings(const ClientSettings& settings) {
+    QSettings values;
+    values.setValue("connection/serverHost", settings.serverHost);
+    values.setValue("connection/serverPort", settings.serverPort);
+    values.setValue("tls/serverCaFile", settings.serverCaFile);
+    values.setValue("tls/clientCertificateFile", settings.clientCertificateFile);
+    values.setValue("tls/clientPrivateKeyFile", settings.clientPrivateKeyFile);
+    values.sync();
+    if (values.status() != QSettings::NoError) {
+        QMessageBox::critical(this, "Settings could not be saved",
+                              "The configuration could not be written to the local settings store.");
+        return false;
+    }
+    return true;
+}
+
+void MainWindow::onRunWorkload() {
+    startWorkload(false);
+}
+
+void MainWindow::onRunGpuWorkload() {
+    startWorkload(true);
+}
+
+void MainWindow::startWorkload(bool gpuWorkload) {
+    if (workloadProcess_->state() != QProcess::NotRunning) {
+        return;
+    }
+    if (settings_.serverHost.isEmpty() || settings_.serverPort.isEmpty() ||
+        settings_.serverCaFile.isEmpty() || settings_.clientCertificateFile.isEmpty() ||
+        settings_.clientPrivateKeyFile.isEmpty()) {
+        ClientSettings edited = settings_;
+        if (!openSettingsDialog(this, &edited)) {
+            return;
+        }
+        if (!saveSettings(edited)) {
+            return;
+        }
+        settings_ = edited;
+        updateConfigurationDisplay();
+    }
+    if (!configurationIsReady()) {
+        updateConfigurationDisplay();
+        QMessageBox::warning(this, "Connection setup needs attention",
+                             "The server address, port, and readable CA/client credential files are required.");
+        return;
+    }
+
+    QStringList arguments{
+        "--server", settings_.serverHost + ":" + settings_.serverPort,
+        "--ca", settings_.serverCaFile,
+        "--cert", settings_.clientCertificateFile,
+        "--key", settings_.clientPrivateKeyFile,
+    };
+    int inputCount = 0;
+    if (gpuWorkload) {
+        bool valid = false;
+        const uint matrixSize = matrixSizeInput_->text().toUInt(&valid);
+        if (!valid || matrixSize < 128 || matrixSize > 512) {
+            QMessageBox::warning(this, "Invalid matrix size",
+                                 "Enter a matrix dimension from 128 to 512.");
+            return;
+        }
+        arguments << "--matrix-size" << QString::number(matrixSize);
+        inputCount = static_cast<int>(matrixSize * matrixSize);
+    } else {
+        const QStringList inputParts = workloadInput_->text().split(',', Qt::KeepEmptyParts);
+        if (inputParts.isEmpty() || inputParts.size() > 4096) {
+            QMessageBox::warning(this, "Invalid workload",
+                                 "Enter between 1 and 4096 unsigned integers separated by commas.");
+            return;
+        }
+        for (const QString& part : inputParts) {
+            bool valid = false;
+            const QString token = part.trimmed();
+            const qulonglong value = token.toULongLong(&valid);
+            if (token.isEmpty() || !valid) {
+                QMessageBox::warning(this, "Invalid workload",
+                                     "Every value must be an unsigned 64-bit decimal integer.");
+                return;
+            }
+            arguments.append(QString::number(value));
+        }
+        inputCount = inputParts.size();
+    }
+
+#ifdef Q_OS_WIN
+    const QString executable = QCoreApplication::applicationDirPath() + "/tuna_sample_app.exe";
+#else
+    const QString executable = QCoreApplication::applicationDirPath() + "/tuna_sample_app";
+#endif
+    if (!QFileInfo::exists(executable)) {
+        QMessageBox::critical(this, "Sample client not found",
+                              "tuna_sample_app must be installed beside the Tuna GUI.");
+        appendActivity("Error: tuna_sample_app was not found beside the GUI.");
+        return;
+    }
+
+    requestTimedOut_ = false;
+    requestCancelled_ = false;
+    requestIsGpu_ = gpuWorkload;
+    runWorkloadButton_->setEnabled(false);
+    runGpuWorkloadButton_->setEnabled(false);
+    configureButton_->setEnabled(false);
+    cancelWorkloadButton_->setEnabled(true);
+    statusLabel_->setText("Sending request to the server...");
+    resultLabel_->setText("Waiting for the remote result.");
+    const QString workloadName = gpuWorkload ? "GPU matrix multiplication" : "sum of squares";
+    appendActivity("Submitting " + workloadName + " workload (" +
+                   QString::number(inputCount) + " input elements) to " +
+                   settings_.serverHost + ":" + settings_.serverPort + ".");
+    workloadProcess_->setProgram(executable);
+    workloadProcess_->setArguments(arguments);
+    workloadProcess_->start();
+    requestTimeout_->start(12000);
+}
+
+void MainWindow::onWorkloadFinished(int exitCode, int exitStatus) {
+    requestTimeout_->stop();
+    runWorkloadButton_->setEnabled(true);
+    runGpuWorkloadButton_->setEnabled(true);
+    configureButton_->setEnabled(true);
+    cancelWorkloadButton_->setEnabled(false);
+    const QString standardOutput = QString::fromLocal8Bit(workloadProcess_->readAllStandardOutput());
+    const QString standardError = QString::fromLocal8Bit(workloadProcess_->readAllStandardError());
+
+    if (requestTimedOut_) {
+        statusLabel_->setText("Request timed out");
+        resultLabel_->setText("The remote request exceeded the client timeout.");
+        appendActivity("Error: remote RPC exceeded the client timeout.");
+        return;
+    }
+    if (requestCancelled_) {
+        statusLabel_->setText("Request cancelled");
+        resultLabel_->setText("The client process was cancelled. The server may have already completed the request.");
+        appendActivity("Request cancelled by the user; remote completion is unknown.");
+        return;
+    }
+    if (exitCode != 0 || exitStatus != static_cast<int>(QProcess::NormalExit)) {
+        statusLabel_->setText("Request failed");
+        resultLabel_->setText("The remote request failed. See Recent activity for the error.");
+        const QString error = standardError.trimmed();
+        appendActivity("Error: " + (error.isEmpty() ? "sample client exited unexpectedly." : error));
+        return;
+    }
+
+    if (requestIsGpu_) {
+        static const QRegularExpression gpuResultPattern(
+            R"(matrix_size=(\d+) result_checksum=([-+0-9.eE]+) result_0_0=([-+0-9.eE]+))");
+        const auto gpuMatch = gpuResultPattern.match(standardOutput);
+        if (!gpuMatch.hasMatch()) {
+            statusLabel_->setText("Invalid GPU-client response");
+            resultLabel_->setText("No valid result was returned. See Recent activity for details.");
+            appendActivity("Error: sample client returned no recognizable GPU result.");
+            return;
+        }
+        statusLabel_->setText("GPU request succeeded");
+        resultLabel_->setText("Remote " + gpuMatch.captured(1) + " × " +
+                              gpuMatch.captured(1) + " matrix; checksum " +
+                              gpuMatch.captured(2) + "; first value " +
+                              gpuMatch.captured(3) + ".");
+        appendActivity("GPU matrix multiplication succeeded at dimension " +
+                       gpuMatch.captured(1) + "; checksum=" + gpuMatch.captured(2) + ".");
+        return;
+    }
+
+    static const QRegularExpression resultPattern(R"(sum_of_squares=(\d+))");
+    const auto match = resultPattern.match(standardOutput);
+    if (!match.hasMatch()) {
+        statusLabel_->setText("Invalid sample-client response");
+        resultLabel_->setText("No valid result was returned. See Recent activity for details.");
+        appendActivity("Error: sample client returned no recognizable result.");
+        return;
+    }
+
+    const QString result = match.captured(1);
+    statusLabel_->setText("Request succeeded");
+    resultLabel_->setText("Remote result: " + result);
+    appendActivity("Request succeeded; remote sum of squares = " + result + ".");
+}

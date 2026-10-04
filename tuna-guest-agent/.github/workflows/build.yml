@@ -1,0 +1,63 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gRPC and Protocol Buffers
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --triplet x64-windows
+
+      - name: Configure Windows client
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DTUNA_BUILD_GUI=OFF `
+            -DTUNA_BUILD_SAMPLE_CLIENT=ON `
+            -DTUNA_BUILD_LINUX_SERVER=OFF
+
+      - name: Build Windows client
+        run: cmake --build build --config Release --parallel
+
+      - name: Smoke-test Windows sample client
+        shell: pwsh
+        run: .\build\bin\tuna_sample_app.exe --help
+
+  linux-client-server:
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ["22.04", "24.04"]
+    runs-on: ubuntu-${{ matrix.ubuntu }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gRPC and Protocol Buffers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgrpc++-dev libprotobuf-dev \
+            protobuf-compiler protobuf-compiler-grpc
+
+      - name: Configure Linux contract test build
+        run: |
+          cmake -S . -B build \
+            -DTUNA_BUILD_GUI=OFF \
+            -DTUNA_BUILD_SAMPLE_CLIENT=ON \
+            -DTUNA_BUILD_LINUX_SERVER=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build client and server
+        run: cmake --build build --parallel
+
+      - name: Run unit and mTLS integration tests
+        run: ctest --test-dir build --output-on-failure
