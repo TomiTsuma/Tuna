@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package tuna.v1;
+
+option cc_enable_arenas = true;
+
+service WorkloadService {
+  rpc RemoteSumOfSquares(RemoteSumOfSquaresRequest)
+      returns (RemoteSumOfSquaresResponse);
+  rpc RemoteMatrixMultiply(RemoteMatrixMultiplyRequest)
+      returns (RemoteMatrixMultiplyResponse);
+}
+
+message RemoteSumOfSquaresRequest {
+  uint32 protocol_version = 1;
+  string request_id = 2;
+  repeated uint64 values = 3;
+}
+
+message RemoteSumOfSquaresResponse {
+  uint32 protocol_version = 1;
+  string request_id = 2;
+  uint64 result = 3;
+}
+
+message RemoteMatrixMultiplyRequest {
+  uint32 protocol_version = 1;
+  string request_id = 2;
+  uint32 matrix_size = 3;
+  repeated float left = 4 [packed = true];
+  repeated float right = 5 [packed = true];
+}
+
+message RemoteMatrixMultiplyResponse {
+  uint32 protocol_version = 1;
+  string request_id = 2;
+  uint32 matrix_size = 3;
+  repeated float result = 4 [packed = true];
+}

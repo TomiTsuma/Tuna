@@ -1,60 +1,53 @@
-cmake_minimum_required(VERSION 3.16)
-project(TunaGuestAgent LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.21)
+project(TunaClient LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
-
-# Point to your Qt installation
-set(CMAKE_PREFIX_PATH "C:/Qt/6.10.0/mingw_64/lib/cmake")
-
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
-
-add_executable(tuna_gui
-    src/gui/main.cpp
-    src/gui/mainwindow.cpp
-    src/gui/mainwindow.h
-    src/gui/mainwindow.ui
-    src/gui/settings_dialog.cpp
-)
-
-target_link_libraries(tuna_gui PRIVATE Qt6::Widgets Qt6::Network)
-
+include(CTest)
 include(FetchContent)
 
-# --- Shared tunnel frame schema (protobuf) ---
-FetchContent_Declare(
-    protobuf
-    GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
-    GIT_TAG v21.12
-)
-set(protobuf_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(protobuf_INSTALL OFF CACHE BOOL "" FORCE)
-set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(protobuf)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+foreach(configuration DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${configuration} "${CMAKE_BINARY_DIR}/bin")
+endforeach()
 
-set(TUNA_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../proto)
-set(TUNA_PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
-file(MAKE_DIRECTORY ${TUNA_PROTO_GEN_DIR})
+# Track A (explicit-workload gRPC/mTLS MVP) targets are opt-in/opt-out here.
+# Track B (driver-API remoting) core libraries and tests are always built.
+option(TUNA_BUILD_GUI "Build the Qt management GUI" OFF)
+option(TUNA_BUILD_SAMPLE_CLIENT "Build the gRPC sample client and workload API" ON)
+option(TUNA_BUILD_LINUX_SERVER "Build ../tuna-server (with its workload API) in this tree" OFF)
 
-add_custom_command(
-    OUTPUT ${TUNA_PROTO_GEN_DIR}/tuna_frames.pb.cc ${TUNA_PROTO_GEN_DIR}/tuna_frames.pb.h
-    COMMAND $<TARGET_FILE:protobuf::protoc> --cpp_out=${TUNA_PROTO_GEN_DIR} -I ${TUNA_PROTO_DIR} ${TUNA_PROTO_DIR}/tuna_frames.proto
-    DEPENDS ${TUNA_PROTO_DIR}/tuna_frames.proto
-    COMMENT "Generating C++ sources from tuna_frames.proto"
-    VERBATIM
-)
+if(TUNA_BUILD_SAMPLE_CLIENT OR TUNA_BUILD_LINUX_SERVER)
+    set(TUNA_SYSTEM_PROTOBUF ON)  # gRPC is in the build; see cmake/TunaProtobuf.cmake
+endif()
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/TunaProtobuf.cmake)
 
-add_library(tuna_proto STATIC
-    ${TUNA_PROTO_GEN_DIR}/tuna_frames.pb.cc
-    ${TUNA_PROTO_GEN_DIR}/tuna_frames.pb.h
-)
-add_dependencies(tuna_proto protobuf::protoc)
-target_include_directories(tuna_proto PUBLIC ${TUNA_PROTO_GEN_DIR})
-target_link_libraries(tuna_proto PUBLIC protobuf::libprotobuf)
+if(TUNA_BUILD_GUI)
+    if(NOT WIN32)
+        message(FATAL_ERROR "The Qt management GUI is a Windows client target; disable TUNA_BUILD_GUI on Linux.")
+    endif()
+    find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets)
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
+    set(CMAKE_AUTOUIC ON)
 
-# --- Core libraries (config, logging, error handling) ---
+    add_executable(tuna_gui
+        src/gui/main.cpp
+        src/gui/mainwindow.cpp
+        src/gui/mainwindow.h
+        src/gui/settings_dialog.cpp
+        src/gui/settings_dialog.h
+    )
+    target_link_libraries(tuna_gui PRIVATE Qt6::Widgets)
+    install(TARGETS tuna_gui RUNTIME DESTINATION bin)
+endif()
+
+if(TUNA_BUILD_SAMPLE_CLIENT)
+    add_subdirectory(client)
+endif()
+
+# --- Track B core libraries (config, logging, error handling) ---
 FetchContent_Declare(
     nlohmann_json
     # Release tarball (~110 KB) instead of a full clone of the repo's history.
@@ -80,25 +73,32 @@ target_include_directories(tuna_core PUBLIC src)
 target_link_libraries(tuna_core PUBLIC nlohmann_json::nlohmann_json spdlog::spdlog)
 
 # --- Test harness (Catch2 + CTest) ---
-FetchContent_Declare(
-    Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG v3.7.1
-)
-FetchContent_MakeAvailable(Catch2)
+if(BUILD_TESTING)
+    FetchContent_Declare(
+        Catch2
+        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+        GIT_TAG v3.7.1
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(Catch2)
+    list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
+    include(Catch)
 
-enable_testing()
-list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
-include(Catch)
+    add_executable(tuna_tests
+        tests/unit/test_config.cpp
+        tests/unit/test_logger.cpp
+        tests/unit/test_error_handler.cpp
+        tests/unit/test_frame_proto.cpp
+    )
+    target_link_libraries(tuna_tests PRIVATE Catch2::Catch2WithMain tuna_proto tuna_core)
+    catch_discover_tests(tuna_tests)
+endif()
 
-add_executable(tuna_tests
-    tests/unit/test_config.cpp
-    tests/unit/test_logger.cpp
-    tests/unit/test_error_handler.cpp
-    tests/unit/test_hooks.cpp
-    tests/unit/test_tunnel.cpp
-    tests/unit/test_frame_proto.cpp
-    tests/integration/test_full_agent.cpp
-)
-target_link_libraries(tuna_tests PRIVATE Catch2::Catch2WithMain tuna_proto tuna_core)
-catch_discover_tests(tuna_tests)
+# Added last so the server's mTLS integration test can see tuna_sample_app.
+if(TUNA_BUILD_LINUX_SERVER)
+    if(WIN32)
+        message(FATAL_ERROR "The Linux server must be built on Linux; use its standalone CMake project.")
+    endif()
+    set(TUNA_SERVER_WORKLOAD_API ON CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tuna-server ${CMAKE_BINARY_DIR}/tuna-server)
+endif()

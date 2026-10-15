@@ -1,4 +1,13 @@
-/build
+/build/
+/build-*/
+/build-all/
+/dist/
+/cmake-build-*/
+*.pem
+*.key
+*.csr
+*.srl
+CMakeLists.txt.user
 tests/*.exe
 tests/*.obj
 __pycache__/

@@ -1,216 +1,159 @@
-# 🐟 Tuna Guest Agent
+# Tuna Windows Client and Linux Server
 
-## Overview
+Tuna is being developed as a **Windows client** that calls a separately built **Linux server**. The Qt frontend supports connection settings and the bounded sample workload flow. Tuna does not provide general-purpose remote execution or transparent interception of third-party applications.
 
-**Tuna Guest Agent** is a lightweight virtualization client that allows low-powered computers to offload compute- and GPU-intensive workloads to a remote, high-performance **Tuna Server**. It creates the illusion that the client machine has access to powerful hardware, while all heavy computation is transparently executed on the server.
+This README documents **Track A**, the shipped explicit-workload MVP. **Track B** is a separate development track that targets transparent CUDA remoting through an `nvcuda.dll` driver shim. It is not implemented beyond core plumbing (`src/core/`) and does not change anything stated here. See the [repository README](../README.md) for how the two tracks relate.
 
-The system works by intercepting key system calls and API-level operations (file, graphics, process, and network calls), routing them through a secure, multiplexed tunnel to the Tuna Server. The user continues working on their local machine as usual—launching applications like Photoshop, Blender, or games—while all compute, rendering, and data processing happen remotely.
+## MVP boundary
 
----
+The first end-to-end API is `RemoteSumOfSquares`: a small Windows sample app sends 1–4,096 unsigned integers to an Ubuntu server and receives the checked sum of their squares. The service requires administrator-provisioned mutual TLS certificates and permits a configured client certificate SAN. It is a protocol/workload vertical slice, not a GPU benchmark.
 
-## Core Features
+The first-release GPU baseline is Ubuntu 22.04/24.04 x64 with an NVIDIA RTX 3060 12 GB (compute capability 8.6) and CUDA Toolkit 12.8. The API includes a CPU sum-of-squares connectivity check and an explicit bounded CUDA matrix-multiplication sample. Neither API intercepts arbitrary Windows APIs, graphics calls, files, processes, or existing applications such as Photoshop or Blender.
 
-* **Secure Multiplexed Tunneling** — QUIC + TLS 1.3-based encrypted communication with bidirectional data streams.
-* **Syscall Interception** — Redirection of CPU, GPU, and I/O system calls to the server using lightweight hooks.
-* **Qt GUI** — Cross-platform, native interface for managing connections, credentials, and performance metrics.
-* **Daemon Mode** — Background service that initializes hooks, manages secure connections, and monitors processes.
-* **Seamless Virtualization** — Offloads computation to Tuna Server without altering user workflows.
-* **Modular Architecture** — Distinct subsystems for GUI, daemon, hooks, and networking.
+## Repository layout
 
----
+Paths are relative to the repository root:
 
-## File and Folder Structure
-
-```
-tuna-guest-agent/
-├── src/
-│   ├── core/                       # OS-agnostic config, logging, error handling
-│   │   ├── config_manager.cpp
-│   │   ├── logger.cpp
-│   │   ├── error_handler.cpp
-│   │   └── platform_utils.cpp
-│   │
-│   ├── daemon/                     # Background service (Tuna Daemon)
-│   │   └── win/                    # Windows Service implementation
-│   │       ├── daemon_main.cpp
-│   │       ├── daemon_service.cpp
-│   │       ├── privilege_utils.cpp
-│   │       └── watchdog.cpp
-│   │
-│   ├── hooks/                      # Hooking and interception logic
-│   │   └── win/                    # MinHook-based Win32/DirectX/CUDA hooks
-│   │       ├── hooks_init.cpp
-│   │       ├── file_hooks.cpp
-│   │       ├── graphics_hooks.cpp
-│   │       ├── process_hooks.cpp
-│   │       ├── network_hooks.cpp
-│   │       ├── memory_hooks.cpp
-│   │       ├── hook_handlers.cpp
-│   │       └── hook_handlers.h
-│   │
-│   ├── tunnel/                     # Communication and transport layer
-│   │   ├── quic_tunnel.cpp
-│   │   ├── multiplexing_layer.cpp
-│   │   ├── data_serializer.cpp
-│   │   ├── handshake_protocol.cpp
-│   │   └── heartbeat.cpp
-│   │
-│   ├── gui/                        # Qt-based graphical frontend
-│   │   ├── main.cpp
-│   │   ├── mainwindow.ui
-│   │   ├── mainwindow.cpp
-│   │   ├── settings_dialog.cpp
-│   │   └── tray_icon.cpp
-│   │
-│   └── main.cpp                    # Unified entry point (launches GUI or daemon)
-│
-├── docs/
-│   ├── architecture_overview.md
-│   ├── daemonization_workflow.md
-│   ├── syscall_interception_design.md
-│   ├── tunneling_protocol.md
-│   └── security_model.md
-│
-├── minhook/                         # Vendored as a git submodule (TsudaKageyu/minhook)
-│
-├── build/                          # Compiled binaries and build artifacts
-│
-├── tests/
-│   ├── unit/                       # Unit tests (Catch2)
-│   ├── integration/                # End-to-end tests (hooks + tunnel)
-│   ├── createfile_hook.c           # Reference prototype for the Phase 3 CreateFileW hook
-│   └── main.c                      # Reference ETW-based file-monitoring experiment (not part of the build)
-│
-├── CMakeLists.txt                  # Build configuration
-├── LICENSE
-└── README.md
+```text
+proto/tuna/v1/workload.proto      Versioned protobuf/gRPC contract (Track A)
+proto/tuna_frames.proto           v1 frame/RPC wire protocol (Track B)
+tuna-guest-agent/client/          Windows RPC client library and sample app
+tuna-guest-agent/src/gui/         Qt management GUI (settings plus sample RPC launcher)
+tuna-guest-agent/src/core/        Track B config / logging / error core
+tuna-guest-agent/tests/           Catch2 unit tests and the mTLS integration test
+tuna-guest-agent/docs/            Architecture, protocol, security, and roadmap
+tuna-server/                      Separate server CMake project, tests, and systemd unit
 ```
 
----
+The GUI uses the sample RPC executable for bounded smoke-test and matrix workloads; it does not maintain a persistent session. Connection settings are saved with Qt's per-user settings store. Its workload screen reports request progress/result and supports cancellation; a separate activity screen shows only events from the current GUI session. Process forwarding, persistent sessions, and live CPU/GPU/latency/throughput telemetry are not implemented and are not represented as dashboard metrics or counts.
 
 ## Dependencies
 
-**Languages**
+### Windows client
 
-* C++20 (core agent, hooks, and networking)
-* Python (optional for testing and build automation)
+- CMake 3.21+
+- C++20 compiler (MSVC x64 recommended for the gRPC/vcpkg build)
+- Protocol Buffers and gRPC C++ packages
+- Qt 6.5+ with the matching compiler kit only when building the GUI
 
-**Libraries & Frameworks**
+From the `tuna-guest-agent/` directory (where `vcpkg.json` lives), install gRPC and protobuf with vcpkg, then configure the client:
 
-* **Qt 6** — GUI and network modules
-* **libcap / polkit** — privilege elevation
-* **OpenSSL** — encryption layer for TLS
-* **libuv / epoll** — asynchronous event loop
-* **protobuf / msgpack** — data serialization
-* **libhook / LD_PRELOAD / Microsoft Detours** — system call interception
-* **spdlog** — logging framework
-* **Catch2** — unit testing framework
-
----
-
-## Build Instructions
-
-```bash
-git clone https://github.com/your-org/tuna-guest-agent.git
-cd tuna-guest-agent
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-sudo make install
+```powershell
+vcpkg install --triplet x64-windows
+cmake -S . -B build `
+  -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE=C:\path\to\vcpkg\scripts\buildsystems\vcpkg.cmake `
+  -DTUNA_BUILD_GUI=OFF `
+  -DTUNA_BUILD_SAMPLE_CLIENT=ON
+cmake --build build --config Release
 ```
 
----
+To build the GUI, install Qt 6.5+ for the same compiler and set `TUNA_BUILD_GUI=ON` and `CMAKE_PREFIX_PATH` to that Qt installation. Build the GUI and sample client in the same CMake tree; both executables are emitted under `build\bin`. Run `build\bin\tuna_gui.exe`, then configure the server host, port, CA, client certificate, and private key in Connection → Settings. The application stores credential file paths, not private key contents. Ensure the private-key file ACLs restrict access to the Windows user running Tuna. Process data, GPU, and throughput metrics remain unavailable.
 
-## Running the Tuna Guest Agent
+To build only the Track B core and its unit tests (no gRPC, no vcpkg; protobuf is fetched automatically), turn the sample client off. The documented Windows toolchain is the Qt-bundled MinGW 13.1 with Ninja:
 
-**Start GUI Mode**
-
-```bash
-tuna-guest-agent --gui
+```powershell
+cmake -S . -B build-ninja -G Ninja -DTUNA_BUILD_SAMPLE_CLIENT=OFF
+cmake --build build-ninja
+ctest --test-dir build-ninja --output-on-failure
 ```
 
-**Run as Background Daemon**
+For an unsigned developer bundle, build both targets with the matching Qt and vcpkg compiler toolchains, then run:
 
-```bash
-sudo systemctl start tuna-guest-agent.service
+```powershell
+.\scripts\package_windows.ps1 `
+  -BuildDirectory build `
+  -OutputDirectory dist\tuna-client `
+  -QtBinDirectory C:\Qt\6.10.0\msvc2022_64\bin
 ```
 
-**Check Daemon Logs**
+The script copies the two executables and vcpkg runtime DLLs, then invokes Qt's `windeployqt`. It does not sign binaries, create an installer, provision certificates, or install a Windows service; do not distribute the unsigned bundle as a production release.
+
+### Linux server
+
+On Ubuntu 22.04/24.04 x64, install CMake, a C++20 compiler, protobuf, and gRPC development packages. For a server-only build:
 
 ```bash
-journalctl -u tuna-guest-agent
+sudo apt update
+sudo apt install -y build-essential cmake libgrpc++-dev libprotobuf-dev \
+  protobuf-compiler protobuf-compiler-grpc
+cmake -S tuna-server -B build-server -DCMAKE_BUILD_TYPE=Release
+cmake --build build-server --parallel
+ctest --test-dir build-server --output-on-failure
 ```
 
----
+Run these commands from the repository root. The Linux server has its own CMake project. A CPU-only local build is useful for protocol and mTLS development, but is not a GPU-release build. To build both the sample client and server on Linux for the local mTLS integration test, configure the `tuna-guest-agent` project with the GUI disabled and server enabled:
 
-## Security Highlights
+```bash
+cmake -S tuna-guest-agent -B build-all -DTUNA_BUILD_GUI=OFF \
+  -DTUNA_BUILD_SAMPLE_CLIENT=ON -DTUNA_BUILD_LINUX_SERVER=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-all --parallel
+ctest --test-dir build-all --output-on-failure
+```
 
-* 🔐 End-to-end encryption using **TLS 1.3** with mutual certificate authentication.
-* 🧩 Sandbox isolation for syscall hooks to prevent privilege escalation.
-* 🧱 All privileged operations follow **least-privilege principles**.
-* ♻️ Automatic key rotation and session renewal to prevent replay attacks.
+The integration test creates short-lived certificates in a temporary directory and checks a valid call, rejected client CA and SAN, server-name validation, and arithmetic overflow. Windows CI also launches the sample client with `--help` to catch missing runtime dependencies.
 
----
+For the production-target GPU build, follow NVIDIA's official CUDA 12.8 installation guidance for the Ubuntu release and compatible driver, verify `nvidia-smi` and `nvcc --version`, then configure the standalone server with `-DTUNA_ENABLE_CUDA=ON`. See [the Linux server guide](../tuna-server/README.md). CUDA execution and the systemd device allowlist have not yet been qualified on RTX 3060 hardware.
 
-## Development Roadmap
+## Local mTLS smoke test
 
-| Status | Feature                               |
-| :----- | :------------------------------------ |
-| ✅      | Daemonization and lifecycle control   |
-| ✅      | Secure tunneling (QUIC/TLS)           |
-| 🔄     | GPU command redirection               |
-| 🔄     | Filesystem virtualization             |
-| 🔲     | Performance optimization and caching  |
-| 🔲     | Packaging for Linux / Windows / macOS |
+Create disposable development certificates using a local CA. The server certificate must contain `DNS:localhost` in its subject alternative names and server-auth usage. The client certificate must contain `DNS:sample-client` and client-auth usage. Do not commit private keys or reuse development certificates in production. The Linux integration test creates these automatically. See [the protocol contract](docs/tunneling_protocol.md) for the certificate trust and identity rules.
 
----
+Start the server on Linux (or locally for a development test):
 
-## Contributing
+```bash
+./build-server/tuna_server \
+  --listen 0.0.0.0:50051 \
+  --cert server.crt \
+  --key server.key \
+  --client-ca client-ca.crt \
+  --allowed-client-san sample-client
+```
 
-We welcome community contributions.
-To contribute:
+Run the Windows sample app with a server name present in the server certificate:
 
-1. Fork this repository.
-2. Create a feature branch:
+```powershell
+.\build\bin\tuna_sample_app.exe `
+  --server localhost:50051 `
+  --ca server-ca.crt `
+  --cert client.crt `
+  --key client.key `
+  3 4
+```
 
-   ```bash
-   git checkout -b feature/new-module
-   ```
-3. Add your changes and commit:
+Expected result for `3 4` is `sum_of_squares=25`. Use the real DNS name when connecting to a remote server and ensure it matches the server certificate. A TLS, authentication, timeout, or server error must fail the call; the client does not silently compute locally.
 
-   ```bash
-   git commit -m "Add new module"
-   ```
-4. Push and open a pull request.
+The GPU sample sends deterministic 128×128 matrices to a CUDA-enabled server:
 
-Please ensure your code is well-documented, unit-tested, and adheres to the coding conventions in `docs/architecture_overview.md`.
+```powershell
+.\build\bin\tuna_sample_app.exe `
+  --server tuna.example.net:50051 `
+  --ca server-ca.crt `
+  --cert client.crt `
+  --key client.key `
+  --matrix-size 128
+```
 
----
+The GPU API accepts dimensions 128–512. The CPU-only development server returns an explicit unavailable error rather than computing on the CPU.
 
-## License
+## Security and deployment notes
 
-This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+- Mutual TLS is mandatory for the sample service. The client validates the server CA/hostname; the server validates the client CA and configured SAN.
+- Production policy requires TLS 1.3 or newer. The current gRPC credential code has not yet demonstrated enforcement of that minimum; verifying and enforcing it is a release blocker.
+- The Linux systemd unit and CMake install rules are available, but account provisioning, firewall exposure, certificate rotation/revocation, runtime quotas, and production package/update automation remain incomplete.
+- The sample server binds to loopback by default. Expose it to a network only through an explicit `--listen` value and suitable firewall rules.
+- Do not send sensitive workloads to this prototype. The sample API is limited and has no persistent job storage.
 
----
+## Documentation and status
 
-## Maintainers
+- [Implementation plan](docs/implementation_plan.md) — staged completion roadmap and acceptance criteria.
+- [Architecture overview](docs/architecture_overview.md) — client/server boundaries and intended evolution.
+- [RPC contract](docs/tunneling_protocol.md) — gRPC, schema, authentication, and compatibility rules.
+- [Security model](docs/security_model.md) — trust boundaries, controls, and remaining blockers.
+- [Interception design](docs/syscall_interception_design.md) — scoped API boundary and future limitations.
+- [Daemon lifecycle](docs/daemonization_workflow.md) — Windows background-service design, not yet implemented.
 
-* **Lead Developer:** Thomas Tsuma
-* **Organization:** Core & Outline
-* **Contact:** [coreandoutline.ai@gmail.com](mailto:coreandoutline.ai@gmail.com)
+## Current implementation status
 
----
-
-### ✅ Developer Setup Checklist
-
-* [ ] Install dependencies (`Qt6`, `libhook`, `libcap`, `protobuf`, `spdlog`)
-* [ ] Build with CMake
-* [ ] Run daemon service
-* [ ] Configure server connection in GUI
-* [ ] Verify tunnel handshake with Tuna Server
-* [ ] Test interception (file, network, graphics)
-* [ ] Validate security and performance metrics
-
----
-
-**Tuna Guest Agent** — Bringing high-end compute to every desktop, effortlessly.
+Implemented in this slice: versioned protobuf schema, Windows gRPC client library/sample CLI, Linux gRPC mTLS server, exact client SAN authorization, bounded CPU and CUDA matrix workload APIs, CUDA 12.8/compute-capability-8.6 production build path, bounded single-request GPU use, server tests, mTLS integration tests, Qt workload UI, Linux CMake install rules/systemd unit, and unsigned Windows developer bundle. Not yet release-qualified: physical RTX 3060 execution, TLS 1.3 minimum enforcement, production certificate lifecycle, Linux signed packaging/update automation, health/metrics, multi-tenant resource isolation, independent security review, and full supported-OS CI results.

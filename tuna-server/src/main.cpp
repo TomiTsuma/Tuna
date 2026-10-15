@@ -6,14 +6,29 @@
 #include "core/config_manager.h"
 #include "core/logger.h"
 
+#ifdef TUNA_SERVER_WORKLOAD_API
+#include "workload/workload_server.h"
+#endif
+
 namespace {
 
 constexpr const char* kVersion = "Tuna Server 0.0.1";
 
-void PrintUsage() {
-    std::puts("Usage: tuna_server [--foreground] [--config <path>]");
-    std::puts("  --foreground   Load config, start logging, run in the foreground.");
+// One binary, two tracks (see the repository README):
+//   Track A - explicit-workload gRPC/mTLS server (workload/), any non --foreground
+//             command line, compiled in when TUNA_SERVER_WORKLOAD_API is on.
+//   Track B - driver-API remoting server, `--foreground [--config PATH]`.
+void PrintUsage(const char* executable) {
+    std::puts("Usage: tuna_server --foreground [--config <path>]");
+    std::puts("  --foreground   Remoting track: load config, start logging, run in the foreground.");
     std::puts("  --config PATH  Path to a JSON config file (default: ./tuna-server.json).");
+#ifdef TUNA_SERVER_WORKLOAD_API
+    std::fflush(stdout);
+    PrintWorkloadServerUsage(executable);
+#else
+    (void)executable;
+    std::puts("(workload API not compiled in; rebuild with -DTUNA_SERVER_WORKLOAD_API=ON)");
+#endif
 }
 
 // Foreground mode: the Phase 1 milestone. Proves config loading and logging
@@ -64,7 +79,7 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             config_path = argv[++i];
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            PrintUsage();
+            PrintUsage(argv[0]);
             return 0;
         }
     }
@@ -73,7 +88,11 @@ int main(int argc, char** argv) {
         return RunForeground(config_path);
     }
 
+#ifdef TUNA_SERVER_WORKLOAD_API
+    return RunWorkloadServer(argc, argv);
+#else
     std::printf("%s (scaffold). Run with --foreground to load config and start logging.\n",
                 kVersion);
     return 0;
+#endif
 }

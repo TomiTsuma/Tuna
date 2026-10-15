@@ -1,7 +1,9 @@
 # Tuna — Execution Plan (API Remoting Revision)
 
 **Date:** 2026-09-23
-**Status:** **Approved / canonical** (2026-10-14) — supersedes §4 of `2026-07-31-tuna-guest-and-server-completion-design.md`. The CUDA-first vertical slice and the v1 wire protocol in §4 govern all implementation; the July file-first slice is retained for history only.
+**Status:** **Approved / canonical for Track B** (2026-10-14; scope clarified 2026-10-15). It supersedes §4 of `2026-07-31-tuna-guest-and-server-completion-design.md`, and the July file-first slice is retained for history only. While this plan was being written, a parallel line of work was merged to `main` (PR #1, 2026-10-04): an explicit-workload gRPC/mTLS MVP, now called **Track A** and planned in `tuna-guest-agent/docs/implementation_plan.md`. On 2026-10-15 the owner chose to keep **both tracks**. Track A is the shippable product. Track B (this plan: CUDA-driver-API remoting, the v1 wire protocol in §4) is the transparent-acceleration track. Both share `proto/`, `tuna-server/` and the security model. See the repository `README.md`.
+>
+> **Interaction with Track A.** Phase 2's mTLS and certificate work should reuse Track A's established conventions (dedicated client CA, exact SAN allowlisting, TLS 1.3 minimum as a release gate). Track A's `tuna_server` already runs the gRPC listener; Track B's listener will be added alongside it in the same binary (`--foreground` today).
 **Author:** Thomas Tsuma (with Claude)
 
 ---
