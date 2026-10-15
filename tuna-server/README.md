@@ -118,4 +118,17 @@ cmake --build tuna-server/build-ninja
 ctest --test-dir tuna-server/build-ninja --output-on-failure
 ```
 
-`tuna_server --foreground --config tuna-server.json` loads a JSON config (`listen_port`, `log_level`), writes a rotating log to `<temp>/tuna-server-logs/tuna-server.log`, and exits cleanly. The listener, per-session worker processes, and the v1 frame protocol (`../proto/tuna_frames.proto`) arrive in Phase 2. Its security model is the *Track B* section of `../tuna-guest-agent/docs/security_model.md`.
+`tuna_server --foreground --config tuna-server.json` loads a JSON config, writes a rotating log to `<temp>/tuna-server-logs/tuna-server.log`, and serves sessions until Ctrl-C (SIGINT/SIGTERM, or Ctrl-Break on Windows):
+
+```json
+{ "listen_port": 7443, "listen_address": "127.0.0.1", "log_level": "info" }
+```
+
+- `listen_port` is required, and `0` picks a free port. The server prints `listening on HOST:PORT` on stdout.
+- `listen_address` defaults to `127.0.0.1`. **Non-loopback addresses are refused** until the TLS transport lands in Phase 2b, because plaintext GPU RPC must never reach a network.
+- Each connection completes a `Hello` handshake (v1 frame protocol, `../proto/tuna_frames.proto`) and is then served on its own thread, with a 3 s heartbeat and a 10 s silence timeout. Phase 2c moves sessions into separate worker processes.
+- Phase 2a serves only the reserved diagnostic echo API (`api_id 0`). Every other `api_id` returns `CUDA_ERROR_NOT_SUPPORTED` until Phase 3's generated CUDA dispatchers.
+
+Check a running server from the client side with `tuna_ping --port 7443 --count 20`. `tuna_rpc_bench` measures RPC latency and batched throughput in-process. Both are built from the shared `../tunnel/` library.
+
+Its security model is the *Track B* section of `../tuna-guest-agent/docs/security_model.md`.

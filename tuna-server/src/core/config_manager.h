@@ -8,6 +8,9 @@ namespace tuna {
 
 struct ServerConfig {
     uint16_t listen_port = 0;
+    // Loopback by default. Non-loopback addresses are refused until the TLS
+    // transport exists (Phase 2b): plaintext GPU RPC must not reach a network.
+    std::string listen_address = "127.0.0.1";
     std::string log_level = "info";
 };
 

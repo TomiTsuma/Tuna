@@ -1,3 +1,4 @@
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -5,6 +6,7 @@
 
 #include "core/config_manager.h"
 #include "core/logger.h"
+#include "remoting/remoting_server.h"
 
 #ifdef TUNA_SERVER_WORKLOAD_API
 #include "workload/workload_server.h"
@@ -20,7 +22,7 @@ constexpr const char* kVersion = "Tuna Server 0.0.1";
 //   Track B - driver-API remoting server, `--foreground [--config PATH]`.
 void PrintUsage(const char* executable) {
     std::puts("Usage: tuna_server --foreground [--config <path>]");
-    std::puts("  --foreground   Remoting track: load config, start logging, run in the foreground.");
+    std::puts("  --foreground   Remoting track: load config, start logging, serve sessions until Ctrl-C.");
     std::puts("  --config PATH  Path to a JSON config file (default: ./tuna-server.json).");
 #ifdef TUNA_SERVER_WORKLOAD_API
     std::fflush(stdout);
@@ -31,8 +33,10 @@ void PrintUsage(const char* executable) {
 #endif
 }
 
-// Foreground mode: the Phase 1 milestone. Proves config loading and logging
-// are wired end-to-end. The accept/listen loop arrives in Phase 2 (transport).
+void HandleStopSignal(int) { tuna::RequestRemotingShutdown(); }
+
+// Foreground mode (Track B): load config, start logging, and serve remoting
+// sessions until SIGINT/SIGTERM.
 int RunForeground(const std::string& config_path) {
     auto config = tuna::ConfigManager::LoadFromFile(config_path);
     if (!config) {
@@ -56,15 +60,24 @@ int RunForeground(const std::string& config_path) {
         log->set_level(level);
     }
     log->info("{} starting in foreground", kVersion);
-    log->info("config: listen_port={}, log_level={}", config->listen_port, config->log_level);
-    log->info("transport listener not yet implemented (Phase 2); exiting cleanly");
-    log->flush();
+    log->info("config: listen_address={}, listen_port={}, log_level={}", config->listen_address,
+              config->listen_port, config->log_level);
 
     std::printf("%s foreground: config OK (listen_port=%u, log_level=%s), logs at %s\n",
                 kVersion, config->listen_port, config->log_level.c_str(), log_dir.c_str());
+    std::fflush(stdout);
+
+    std::signal(SIGINT, HandleStopSignal);
+    std::signal(SIGTERM, HandleStopSignal);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, HandleStopSignal);  // Windows Ctrl-Break / CTRL_BREAK_EVENT
+#endif
+    const int exit_code = tuna::ServeRemoting(*config, log);
+    log->info("{} stopped (exit code {})", kVersion, exit_code);
+    log->flush();
 
     tuna::Logger::Shutdown();
-    return 0;
+    return exit_code;
 }
 
 }  // namespace

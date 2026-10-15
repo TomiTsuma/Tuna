@@ -7,7 +7,7 @@ Tuna lets a machine without a capable GPU use a remote server's GPU. Development
 | Idea | An application calls a typed Tuna RPC (`RemoteSumOfSquares`, `RemoteMatrixMultiply`), and the server runs a fixed, bounded workload. | Unmodified CUDA apps (CUDA samples, PyTorch) load a replacement `nvcuda.dll`. Their driver API calls are forwarded to a per-session worker that runs them on the server's real GPU. |
 | Transport | gRPC over mutual TLS | v1 length-prefixed protobuf frames over TCP + TLS 1.3 (msquic later) |
 | Contract | [`proto/tuna/v1/workload.proto`](proto/tuna/v1/workload.proto) | [`proto/tuna_frames.proto`](proto/tuna_frames.proto) |
-| Status | **Working MVP**: Windows client and GUI, Linux server, CPU path and mTLS tested. The GPU path still needs qualification on RTX 3060 hardware. | **Phase 1 done** (config, logging, error core, v1 protocol). Phase 2 (transport + RPC runtime) is next. |
+| Status | **Working MVP**: Windows client and GUI, Linux server, CPU path and mTLS tested. The GPU path still needs qualification on RTX 3060 hardware. | **Phase 2a done**: shared `tunnel/` library (framing, TCP transport, handshake, heartbeat, batched RPC runtime) and the `--foreground` session listener, loopback only. Next: 2b TLS/mTLS, then 2c per-session worker processes. |
 | Plan | [`tuna-guest-agent/docs/implementation_plan.md`](tuna-guest-agent/docs/implementation_plan.md) | [`docs/plans/2026-09-23-tuna-execution-plan.md`](docs/plans/2026-09-23-tuna-execution-plan.md) |
 
 The tracks are complementary. Track A gives a secure, usable product today, for workloads that can be expressed as explicit calls. Track B is the longer bet on transparent acceleration. It reuses Track A's security posture (mTLS, a dedicated CA, identity allowlists), and it goes further because clients there run arbitrary GPU code. Both are covered in [the security model](tuna-guest-agent/docs/security_model.md).
@@ -18,7 +18,8 @@ The tracks are complementary. Track A gives a secure, usable product today, for 
 proto/                 Wire contracts for both tracks
 cmake/                 Shared CMake helpers (protobuf + frame-proto library)
 tuna-guest-agent/      Windows client: Qt GUI, gRPC sample client, Track B core, tests, docs
-tuna-server/           Server: one `tuna_server` binary, Track A (src/workload) + Track B (src/core)
+tuna-server/           Server: one `tuna_server` binary, Track A (src/workload) + Track B (src/core, src/remoting)
+tunnel/                Track B transport + RPC runtime shared by client and server, plus tuna_ping / tuna_rpc_bench
 docs/plans/            Track B execution plan and earlier design history
 docs/changelog/        Per-change engineering log
 .github/workflows/     CI: Windows client, Windows server core, Linux client+server (Ubuntu 22.04/24.04)

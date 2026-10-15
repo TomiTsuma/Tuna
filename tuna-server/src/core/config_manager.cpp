@@ -25,6 +25,9 @@ std::optional<ServerConfig> ConfigManager::LoadFromFile(const std::string& path)
     ServerConfig config;
     try {
         config.listen_port = parsed.at("listen_port").get<uint16_t>();
+        if (parsed.contains("listen_address")) {
+            config.listen_address = parsed.at("listen_address").get<std::string>();
+        }
         if (parsed.contains("log_level")) {
             config.log_level = parsed.at("log_level").get<std::string>();
         }

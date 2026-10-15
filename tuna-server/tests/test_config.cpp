@@ -25,6 +25,14 @@ TEST_CASE("ServerConfigManager defaults log_level to info", "[config]") {
     auto result = tuna::ConfigManager::LoadFromFile(path.string());
     REQUIRE(result.has_value());
     CHECK(result->log_level == "info");
+    CHECK(result->listen_address == "127.0.0.1");
+}
+
+TEST_CASE("ServerConfigManager reads an explicit listen_address", "[config]") {
+    auto path = writeTempConfig(R"({"listen_port": 4433, "listen_address": "::1"})");
+    auto result = tuna::ConfigManager::LoadFromFile(path.string());
+    REQUIRE(result.has_value());
+    CHECK(result->listen_address == "::1");
 }
 
 TEST_CASE("ServerConfigManager rejects missing required field", "[config]") {

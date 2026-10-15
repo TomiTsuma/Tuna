@@ -28,6 +28,7 @@ if(TUNA_SERVER_WORKLOAD_API)
     set(TUNA_SYSTEM_PROTOBUF ON)  # gRPC is in the build; see cmake/TunaProtobuf.cmake
 endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/TunaProtobuf.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/TunaTunnel.cmake)
 
 # --- Track B core libraries (config, logging) ---
 FetchContent_Declare(
@@ -114,8 +115,8 @@ if(TUNA_SERVER_WORKLOAD_API)
     endif()
 endif()
 
-add_executable(tuna_server src/main.cpp)
-target_link_libraries(tuna_server PRIVATE tuna_server_core)
+add_executable(tuna_server src/main.cpp src/remoting/remoting_server.cpp)
+target_link_libraries(tuna_server PRIVATE tuna_server_core tuna_tunnel)
 if(TUNA_SERVER_WORKLOAD_API)
     target_link_libraries(tuna_server PRIVATE tuna_workload)
     target_compile_definitions(tuna_server PRIVATE TUNA_SERVER_WORKLOAD_API=1)
@@ -147,6 +148,17 @@ if(BUILD_TESTING)
     )
     target_link_libraries(tuna_server_tests PRIVATE Catch2::Catch2WithMain tuna_proto tuna_server_core)
     catch_discover_tests(tuna_server_tests)
+    tuna_add_tunnel_tests()
+
+    # Real binaries end to end: --foreground listener + tuna_ping sessions.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME tuna_foreground_session
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_foreground_session.py"
+                "$<TARGET_FILE:tuna_server>" "$<TARGET_FILE:tuna_ping>")
+        set_tests_properties(tuna_foreground_session PROPERTIES TIMEOUT 90)
+    endif()
 
     # Track A (plain executables, as authored in PR #1)
     if(TUNA_SERVER_WORKLOAD_API)
