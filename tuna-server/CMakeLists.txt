@@ -115,8 +115,15 @@ if(TUNA_SERVER_WORKLOAD_API)
     endif()
 endif()
 
-add_executable(tuna_server src/main.cpp src/remoting/remoting_server.cpp)
+add_executable(tuna_server
+    src/main.cpp
+    src/remoting/remoting_server.cpp
+    src/remoting/worker_process.cpp
+    src/remoting/worker_session.cpp
+    src/remoting/dispatch.cpp
+)
 target_link_libraries(tuna_server PRIVATE tuna_server_core tuna_tunnel)
+target_compile_options(tuna_server PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 if(TUNA_SERVER_WORKLOAD_API)
     target_link_libraries(tuna_server PRIVATE tuna_workload)
     target_compile_definitions(tuna_server PRIVATE TUNA_SERVER_WORKLOAD_API=1)

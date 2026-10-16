@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -11,6 +12,11 @@ namespace tuna::tunnel {
 // Native socket handle, wide enough for both Winsock SOCKET and a POSIX fd.
 using NativeSocket = std::intptr_t;
 constexpr NativeSocket kInvalidSocket = -1;
+
+// Initializes the socket library (WSAStartup on Windows; no-op elsewhere).
+// Every TcpStream/TcpListener entry point calls it; code that creates sockets
+// by other means (a worker adopting a handed-off socket) calls it first.
+void InitSockets();
 
 // A connected TCP stream (move-only, closes on destruction).
 // TCP_NODELAY is always on: RPC latency matters more than packet count.
@@ -36,6 +42,15 @@ public:
     // Blocks for at least one byte. Returns bytes read; 0 on orderly close or
     // error (callers treat both as end of stream).
     size_t Receive(char* buffer, size_t capacity);
+
+    // Reads exactly `size` bytes, never more (the bytes after them belong to
+    // whoever the stream is handed to next). False on timeout, close or error.
+    bool ReceiveExact(char* buffer, size_t size, std::chrono::milliseconds timeout);
+
+    // The native handle, still owned by this stream.
+    NativeSocket native() const { return socket_.load(); }
+    // Gives up ownership of the native handle (for handing it to another process).
+    NativeSocket Release() { return socket_.exchange(kInvalidSocket); }
 
     // Unblocks any thread in Receive()/SendAll(); safe to call from any thread.
     // On Windows this also closes the handle: Winsock's shutdown() does not

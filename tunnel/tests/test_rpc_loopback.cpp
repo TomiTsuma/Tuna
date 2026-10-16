@@ -20,6 +20,8 @@ constexpr uint32_t kEcho = 1;       // out_args = args
 constexpr uint32_t kFail = 2;       // result = 700 (CUDA_ERROR_ILLEGAL_ADDRESS)
 constexpr uint32_t kIncrement = 3;  // counter += 1
 constexpr uint32_t kRead = 4;       // out_args = counter
+constexpr uint32_t kBulkEcho = 5;   // bulk_out = bulk_in
+constexpr uint32_t kBulkCount = 6;  // counter += bulk_in.size()
 constexpr int32_t kIllegalAddress = 700;
 
 Hello MakeHello(const std::string& os) {
@@ -49,7 +51,7 @@ public:
             device->set_cc_major(8);
             device->set_cc_minor(6);
             if (!ExchangeHello(*server_transport_, local, 2s)) return;
-            RpcServer server(*server_transport_, [this](const RpcRequest& r) { return Dispatch(r); },
+            RpcServer server(*server_transport_, [this](ServerCall& c) { return Dispatch(c); },
                              server_heartbeat);
             served_ = server.Serve();
         });
@@ -74,9 +76,12 @@ public:
     std::atomic<uint64_t> served_{0};
 
 private:
-    RpcResponse Dispatch(const RpcRequest& request) {
+    RpcResponse Dispatch(ServerCall& call) {
+        const RpcRequest& request = call.request;
         RpcResponse response;
         switch (request.api_id()) {
+            case kBulkEcho: call.bulk_out = call.bulk_in; break;
+            case kBulkCount: counter_ += call.bulk_in.size(); break;
             case kEcho: response.set_out_args(request.args()); break;
             case kFail: response.set_result(kIllegalAddress); break;
             case kIncrement: ++counter_; break;
