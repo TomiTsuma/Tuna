@@ -29,6 +29,7 @@ if(TUNA_SERVER_WORKLOAD_API)
 endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/TunaProtobuf.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/TunaTunnel.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/TunaCuda.cmake)
 
 # --- Track B core libraries (config, logging) ---
 FetchContent_Declare(
@@ -156,6 +157,9 @@ if(BUILD_TESTING)
     target_link_libraries(tuna_server_tests PRIVATE Catch2::Catch2WithMain tuna_proto tuna_server_core)
     catch_discover_tests(tuna_server_tests)
     tuna_add_tunnel_tests()
+    if(TUNA_BUILD_CUDA_SHIM)
+        tuna_add_cuda_tests()
+    endif()
 
     # Real binaries end to end: --foreground listener + tuna_ping sessions.
     find_package(Python3 COMPONENTS Interpreter QUIET)
