@@ -1,3 +1,4 @@
+#include "workload_server.h"
 #include "workload_service.h"
 #include "gpu_matrix.h"
 
@@ -20,12 +21,6 @@ struct Options {
     std::string allowed_client_san;
 };
 
-void usage(const char* executable) {
-    std::cerr << "Usage: " << executable
-              << " --cert SERVER_CERT.pem --key SERVER_KEY.pem --client-ca CLIENT_CA.pem"
-                 " --allowed-client-san DNS:client-name [--listen HOST:PORT]\n";
-}
-
 bool parse_options(int argc, char* argv[], Options* options) {
     for (int i = 1; i < argc; ++i) {
         const std::string name = argv[i];
@@ -42,7 +37,7 @@ bool parse_options(int argc, char* argv[], Options* options) {
     }
     if (options->certificate_file.empty() || options->private_key_file.empty() ||
         options->client_ca_file.empty() || options->allowed_client_san.empty()) {
-        usage(argv[0]);
+        PrintWorkloadServerUsage(argv[0]);
         return false;
     }
     return true;
@@ -50,14 +45,14 @@ bool parse_options(int argc, char* argv[], Options* options) {
 
 }  // namespace
 
-int main(int argc, char* argv[]) {
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--help") {
-            usage(argv[0]);
-            return 0;
-        }
-    }
+void PrintWorkloadServerUsage(const char* executable) {
+    std::cerr << "Usage: " << executable
+              << " --cert SERVER_CERT.pem --key SERVER_KEY.pem --client-ca CLIENT_CA.pem"
+                 " --allowed-client-san DNS:client-name [--listen HOST:PORT]\n";
+}
 
+// --help is handled by main.cpp before dispatching here.
+int RunWorkloadServer(int argc, char* argv[]) {
     Options options;
     try {
         if (!parse_options(argc, argv, &options)) {

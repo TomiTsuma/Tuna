@@ -2,7 +2,7 @@
 
 ## Purpose and scope
 
-This plan turns the current Tuna Guest Agent concept and GUI prototype into a secure, testable product with a **Windows client** and a **Linux server**. The Linux server is being added under `tuna-server/` in this repository as a distinct build/deployable, while remaining suitable for extraction into its own repository later.
+This plan turns the current Tuna Guest Agent concept and GUI prototype into a secure, testable product with a **Windows client** and a **Linux server**. The Linux server lives in the repository-root `tuna-server/` directory as a distinct build/deployable, while remaining suitable for extraction into its own repository later.
 
 The target experience is that a Windows user can configure and observe a Tuna connection, submit supported work to a Linux Tuna Server, and receive results without compromising the Windows machine or server. “Complete” must mean a clearly defined set of supported operations; it must not imply that arbitrary Windows applications can transparently move their CPU, GPU, system calls, or device access to Linux.
 

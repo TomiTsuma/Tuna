@@ -2,7 +2,7 @@
 
 ## Status
 
-The current Windows client is a Qt GUI that launches `tuna_sample_app` as a child process for one bounded RPC. It does not install a Windows Service, run at boot, maintain a persistent tunnel, inject into applications, or expose local IPC. The Linux Tuna Server is a separate Linux service documented in `tuna-server/README.md`; it must not be managed by Windows SCM.
+The current Windows client is a Qt GUI that launches `tuna_sample_app` as a child process for one bounded RPC. It does not install a Windows Service, run at boot, maintain a persistent tunnel, inject into applications, or expose local IPC. The Linux Tuna Server is a separate Linux service documented in `../tuna-server/README.md` (repository root); it must not be managed by Windows SCM.
 
 This document records a future lifecycle design only. Do not describe a service as shipped until installer, upgrade, recovery, and clean-machine tests exist.
 

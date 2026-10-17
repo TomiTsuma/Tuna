@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Protobuf REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 
-set(TUNA_PROTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../protocol")
+set(TUNA_PROTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../proto")  # shared with tuna-server
 set(TUNA_PROTO_FILE "${TUNA_PROTO_ROOT}/tuna/v1/workload.proto")
 set(TUNA_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(TUNA_PROTO_SOURCE "${TUNA_GENERATED_DIR}/tuna/v1/workload.pb.cc")

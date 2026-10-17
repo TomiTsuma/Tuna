@@ -1,4 +1,15 @@
-# Tuna Linux Server
+# Tuna Server
+
+One `tuna_server` binary, two tracks (see the [repository README](../README.md)):
+
+| Track | What it is | How it is invoked | Status |
+|---|---|---|---|
+| **A — explicit workload API** | gRPC + mutual TLS service: `RemoteSumOfSquares`, `RemoteMatrixMultiply` (CUDA). Source: `src/workload/`. | `tuna_server --cert … --key … --client-ca … --allowed-client-san …` | Working MVP (CPU path CI-tested; GPU path awaiting RTX 3060 qualification). |
+| **B — CUDA driver-API remoting** | Server side of the `nvcuda.dll` shim design in `../docs/plans/2026-09-23-tuna-execution-plan.md`. Source: `src/core/`. | `tuna_server --foreground [--config PATH]` | Phase 1 (config + logging); transport arrives in Phase 2. |
+
+Track A is compiled in when `TUNA_SERVER_WORKLOAD_API=ON` (default on Linux, off on Windows because it needs gRPC). Everything below up to *Track B* documents Track A.
+
+## Track A — Linux workload server
 
 The Linux server implements the versioned `tuna.v1` gRPC API. The initial product slice includes a CPU sum-of-squares connectivity check and a CUDA matrix-multiplication workload. A first-release GPU deployment requires an NVIDIA RTX 3060 (compute capability 8.6) and CUDA Toolkit 12.8 or newer within the validated support matrix. There is no CPU fallback for GPU requests.
 
@@ -96,3 +107,15 @@ Open TCP/50051 only to trusted client networks. Validate certificate name/chain,
 - A single active GPU request is bounded; general user quotas, fair scheduling, cross-tenant isolation, and denial-of-service controls remain incomplete.
 
 NVIDIA references: [CUDA 12.8 Toolkit Release Notes — driver versions](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/index.html) and [CUDA Compatibility Guide](https://docs.nvidia.com/deploy/cuda-compatibility/).
+
+## Track B — remoting server core (`--foreground`)
+
+Builds anywhere, with no gRPC dependency (pass `-DTUNA_SERVER_WORKLOAD_API=OFF` on Linux to build only this track). On Windows the documented toolchain is the Qt-bundled MinGW 13.1 + Ninja:
+
+```bash
+cmake -S tuna-server -B tuna-server/build-ninja -G Ninja -DTUNA_SERVER_WORKLOAD_API=OFF
+cmake --build tuna-server/build-ninja
+ctest --test-dir tuna-server/build-ninja --output-on-failure
+```
+
+`tuna_server --foreground --config tuna-server.json` loads a JSON config (`listen_port`, `log_level`), writes a rotating log to `<temp>/tuna-server-logs/tuna-server.log`, and exits cleanly. The listener, per-session worker processes, and the v1 frame protocol (`../proto/tuna_frames.proto`) arrive in Phase 2. Its security model is the *Track B* section of `../tuna-guest-agent/docs/security_model.md`.

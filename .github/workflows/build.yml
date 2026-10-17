@@ -5,8 +5,12 @@ on:
   pull_request:
 
 jobs:
+  # Track A Windows client (gRPC via vcpkg) + Track B core unit tests.
   windows-client:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tuna-guest-agent
     steps:
       - uses: actions/checkout@v4
 
@@ -33,12 +37,34 @@ jobs:
         shell: pwsh
         run: .\build\bin\tuna_sample_app.exe --help
 
+      - name: Run unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # Track B server core on Windows: no gRPC, FetchContent protobuf.
+  windows-server-core:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure server (remoting core only)
+        run: cmake -S tuna-server -B build-server -A x64 -DTUNA_SERVER_WORKLOAD_API=OFF
+
+      - name: Build server
+        run: cmake --build build-server --config Release --parallel
+
+      - name: Run server unit tests
+        run: ctest --test-dir build-server -C Release --output-on-failure
+
+  # Track A client + server + mTLS integration, and Track B tests, on Linux.
   linux-client-server:
     strategy:
       fail-fast: false
       matrix:
         ubuntu: ["22.04", "24.04"]
     runs-on: ubuntu-${{ matrix.ubuntu }}
+    defaults:
+      run:
+        working-directory: tuna-guest-agent
     steps:
       - uses: actions/checkout@v4
 

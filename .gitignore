@@ -1,0 +1,16 @@
+# Build output (all generators / toolchains)
+build/
+build-*/
+out/
+*.obj
+*.exe
+*.pb.cc
+*.pb.h
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor/IDE
+*.user

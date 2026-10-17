@@ -16,7 +16,7 @@ Windows 10/11 x64                         Ubuntu 22.04/24.04 x64
 |   gRPC client library      |  HTTP/2     |   input limits / workload  |
 |   Qt GUI prototype         |            |   checked result handling  |
 +----------------------------+            +----------------------------+
-             \________ shared protocol/tuna/v1/workload.proto ________/
+             \_______ shared ../proto/tuna/v1/workload.proto _______/
 ```
 
 The sample service uses administrator-managed certificates. The client validates the server trust chain and DNS name. The server validates client certificates and permits the configured subject alternative name. TLS 1.3 is the production minimum; actual minimum-version enforcement remains a release gate for the selected gRPC/TLS build.
@@ -25,8 +25,8 @@ The sample service uses administrator-managed certificates. The client validates
 
 - `client/`: Windows C++ gRPC API and sample command-line application.
 - `src/gui/`: Qt UI for per-user settings, the bounded sample workload, and in-session activity. It launches the RPC CLI asynchronously; no persistent session, process forwarding, or live telemetry is implemented.
-- `protocol/tuna/v1/`: versioned protobuf contract shared by client and server.
-- `tuna-server/`: independently configured Linux CMake service and unit tests.
+- `../proto/tuna/v1/` (repository root): versioned protobuf contract shared by client and server.
+- `../tuna-server/` (repository root): independently configured server CMake project and tests.
 - `docs/`: product plan, protocol, security, interception limitations, and lifecycle design.
 
 ## First workload semantics

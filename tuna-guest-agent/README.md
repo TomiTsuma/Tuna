@@ -2,6 +2,8 @@
 
 Tuna is being developed as a **Windows client** that calls a separately built **Linux server**. The Qt frontend supports connection settings and the bounded sample workload flow. Tuna does not provide general-purpose remote execution or transparent interception of third-party applications.
 
+This README documents **Track A**, the shipped explicit-workload MVP. **Track B** is a separate development track that targets transparent CUDA remoting through an `nvcuda.dll` driver shim. It is not implemented beyond core plumbing (`src/core/`) and does not change anything stated here. See the [repository README](../README.md) for how the two tracks relate.
+
 ## MVP boundary
 
 The first end-to-end API is `RemoteSumOfSquares`: a small Windows sample app sends 1–4,096 unsigned integers to an Ubuntu server and receives the checked sum of their squares. The service requires administrator-provisioned mutual TLS certificates and permits a configured client certificate SAN. It is a protocol/workload vertical slice, not a GPU benchmark.
@@ -10,12 +12,17 @@ The first-release GPU baseline is Ubuntu 22.04/24.04 x64 with an NVIDIA RTX 3060
 
 ## Repository layout
 
+Paths are relative to the repository root:
+
 ```text
-protocol/tuna/v1/workload.proto  Versioned protobuf/gRPC contract
-client/                          Windows RPC client library and sample app
-src/gui/                         Qt management GUI (settings plus sample RPC launcher)
-tuna-server/                     Separate Linux server CMake project, tests, and systemd unit
-docs/                             Architecture, protocol, security, and roadmap
+proto/tuna/v1/workload.proto      Versioned protobuf/gRPC contract (Track A)
+proto/tuna_frames.proto           v1 frame/RPC wire protocol (Track B)
+tuna-guest-agent/client/          Windows RPC client library and sample app
+tuna-guest-agent/src/gui/         Qt management GUI (settings plus sample RPC launcher)
+tuna-guest-agent/src/core/        Track B config / logging / error core
+tuna-guest-agent/tests/           Catch2 unit tests and the mTLS integration test
+tuna-guest-agent/docs/            Architecture, protocol, security, and roadmap
+tuna-server/                      Separate server CMake project, tests, and systemd unit
 ```
 
 The GUI uses the sample RPC executable for bounded smoke-test and matrix workloads; it does not maintain a persistent session. Connection settings are saved with Qt's per-user settings store. Its workload screen reports request progress/result and supports cancellation; a separate activity screen shows only events from the current GUI session. Process forwarding, persistent sessions, and live CPU/GPU/latency/throughput telemetry are not implemented and are not represented as dashboard metrics or counts.
@@ -29,7 +36,7 @@ The GUI uses the sample RPC executable for bounded smoke-test and matrix workloa
 - Protocol Buffers and gRPC C++ packages
 - Qt 6.5+ with the matching compiler kit only when building the GUI
 
-Install gRPC and protobuf with vcpkg, then configure the client:
+From the `tuna-guest-agent/` directory (where `vcpkg.json` lives), install gRPC and protobuf with vcpkg, then configure the client:
 
 ```powershell
 vcpkg install --triplet x64-windows
@@ -42,6 +49,14 @@ cmake --build build --config Release
 ```
 
 To build the GUI, install Qt 6.5+ for the same compiler and set `TUNA_BUILD_GUI=ON` and `CMAKE_PREFIX_PATH` to that Qt installation. Build the GUI and sample client in the same CMake tree; both executables are emitted under `build\bin`. Run `build\bin\tuna_gui.exe`, then configure the server host, port, CA, client certificate, and private key in Connection → Settings. The application stores credential file paths, not private key contents. Ensure the private-key file ACLs restrict access to the Windows user running Tuna. Process data, GPU, and throughput metrics remain unavailable.
+
+To build only the Track B core and its unit tests (no gRPC, no vcpkg; protobuf is fetched automatically), turn the sample client off. The documented Windows toolchain is the Qt-bundled MinGW 13.1 with Ninja:
+
+```powershell
+cmake -S . -B build-ninja -G Ninja -DTUNA_BUILD_SAMPLE_CLIENT=OFF
+cmake --build build-ninja
+ctest --test-dir build-ninja --output-on-failure
+```
 
 For an unsigned developer bundle, build both targets with the matching Qt and vcpkg compiler toolchains, then run:
 
@@ -67,10 +82,10 @@ cmake --build build-server --parallel
 ctest --test-dir build-server --output-on-failure
 ```
 
-Run these commands from the repository root. The Linux server has its own CMake project. A CPU-only local build is useful for protocol and mTLS development, but is not a GPU-release build. To build both the sample client and server on Linux for the local mTLS integration test, configure the root project with the GUI disabled and server enabled:
+Run these commands from the repository root. The Linux server has its own CMake project. A CPU-only local build is useful for protocol and mTLS development, but is not a GPU-release build. To build both the sample client and server on Linux for the local mTLS integration test, configure the `tuna-guest-agent` project with the GUI disabled and server enabled:
 
 ```bash
-cmake -S . -B build-all -DTUNA_BUILD_GUI=OFF \
+cmake -S tuna-guest-agent -B build-all -DTUNA_BUILD_GUI=OFF \
   -DTUNA_BUILD_SAMPLE_CLIENT=ON -DTUNA_BUILD_LINUX_SERVER=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build-all --parallel
@@ -79,7 +94,7 @@ ctest --test-dir build-all --output-on-failure
 
 The integration test creates short-lived certificates in a temporary directory and checks a valid call, rejected client CA and SAN, server-name validation, and arithmetic overflow. Windows CI also launches the sample client with `--help` to catch missing runtime dependencies.
 
-For the production-target GPU build, follow NVIDIA's official CUDA 12.8 installation guidance for the Ubuntu release and compatible driver, verify `nvidia-smi` and `nvcc --version`, then configure the standalone server with `-DTUNA_ENABLE_CUDA=ON`. See [the Linux server guide](tuna-server/README.md). CUDA execution and the systemd device allowlist have not yet been qualified on RTX 3060 hardware.
+For the production-target GPU build, follow NVIDIA's official CUDA 12.8 installation guidance for the Ubuntu release and compatible driver, verify `nvidia-smi` and `nvcc --version`, then configure the standalone server with `-DTUNA_ENABLE_CUDA=ON`. See [the Linux server guide](../tuna-server/README.md). CUDA execution and the systemd device allowlist have not yet been qualified on RTX 3060 hardware.
 
 ## Local mTLS smoke test
 
