@@ -22,6 +22,7 @@ if(TUNA_BUILD_SAMPLE_CLIENT OR TUNA_BUILD_LINUX_SERVER)
     set(TUNA_SYSTEM_PROTOBUF ON)  # gRPC is in the build; see cmake/TunaProtobuf.cmake
 endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/TunaProtobuf.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/TunaTunnel.cmake)
 
 if(TUNA_BUILD_GUI)
     if(NOT WIN32)
@@ -92,6 +93,7 @@ if(BUILD_TESTING)
     )
     target_link_libraries(tuna_tests PRIVATE Catch2::Catch2WithMain tuna_proto tuna_core)
     catch_discover_tests(tuna_tests)
+    tuna_add_tunnel_tests()
 endif()
 
 # Added last so the server's mTLS integration test can see tuna_sample_app.

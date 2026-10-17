@@ -48,7 +48,7 @@ Treat all network requests as untrusted, even when they arrive over an authentic
 
 ## Track B — CUDA driver-API remoting (draft)
 
-*Status: design draft, Phase 1 of `docs/plans/2026-09-23-tuna-execution-plan.md`. None of the controls below are implemented yet. They are requirements that later phases must meet. Track B ships only after Phase 6 (security hardening) is complete.*
+*Status: partly implemented. Phase 2 (2026-10-16) delivered the transport, identity and process-isolation controls marked **[implemented]** below. Every other control is still a requirement for later phases. Track B ships only after Phase 6 (security hardening) is complete.*
 
 ### What changes compared with Track A
 
@@ -65,15 +65,21 @@ Track A accepts only bounded, typed requests. Track B makes the client's CUDA dr
 
 ### Transport and identity
 
-- **TLS 1.3 with mutual authentication**, using the same rules as Track A: a dedicated client CA, exact identity allowlisting, no insecure fallback. Because TLS provides the encryption, the v1 frame protocol carries a plain `payload` field and adds no second encryption layer.
-- Certificates come from operator tooling planned for Phase 2 (`tuna-server --gen-ca`, `--issue-client-cert`). Private keys never leave the machine they are generated on.
+- **[implemented] TLS 1.3 with mutual authentication**, using the same rules as Track A. OpenSSL is configured with a TLS 1.3 minimum and no session tickets, and peer verification is required. A client must chain to the configured CA **and** carry a DNS/URI SAN that exactly matches an entry in `allowed_client_names`. An empty allowlist is a config error. The client verifies the server chain plus the server's host name or IP. EKU is enforced (serverAuth/clientAuth). Because TLS provides the encryption, the v1 frame protocol carries a plain `payload` field and adds no second encryption layer.
+  - Tests reject: an untrusted CA, a trusted but non-allowlisted identity, a client presenting no certificate, a TLS 1.2-only client, a server-name mismatch, and a silent peer (handshake timeout).
+- **[implemented] No insecure fallback.** Without a `tls` config section the server is plaintext, and it **refuses to bind any non-loopback address**. Plaintext exists only for local development and tests.
+- **[implemented] Certificate tooling:** `tuna_server --gen-ca`, `--issue-client-cert`, `--issue-server-cert`. EC P-256 keys, a CA restricted to `pathlen:0`, 397-day leaf validity by default. It never overwrites a file, and on POSIX it creates keys with mode 0600. On Windows, key files inherit their directory's ACL, so operators must keep PKI directories private. Private keys never need to leave the machine they are generated on.
+- **Bulk socket authorization [implemented].** A session's second (bulk) connection is routed by a random 128-bit session token. The token is delivered only inside the TLS-protected `Hello`, but it is sent in plaintext in the bulk connection's preamble. The token is therefore treated as a *routing hint, not a credential*. The worker accepts the bulk connection only if it passes mTLS as the same client identity as the session.
 - The first frame in each direction is `Hello`. The server reports its protocol and driver version, and rejects incompatible clients before it creates a CUDA context.
 
 ### Isolation: one worker process per session
 
-- The listener only accepts connections, authenticates them, and spawns a **separate `tuna-worker` process for each session**, handing over the authenticated socket. The listener never creates a CUDA context and never parses `RpcRequest.args`.
+- **[implemented]** The listener only accepts connections and spawns a **separate worker process for each session** (`tuna_server --worker`, same binary), handing over the raw socket. The listener never creates a CUDA context, never parses `RpcRequest.args`, and does not even run TLS. It reads only a fixed 24-byte routing preamble.
+  - *Deviation from the original draft, which had the listener authenticate before the handoff:* userspace TLS state cannot be moved between processes (OpenSSL cannot export a live session, and Windows has no kTLS). So the worker performs the handshake, which is sshd's pre-authentication privilege-separation model.
+  - Containment for that: `max_sessions` bounds concurrent workers, including unauthenticated ones; at most 64 connections may be pending their preamble; preamble and handshake each time out after 5 s.
+- **[implemented]** Workers never outlive the listener. The listener's end of each worker's IPC channel closes when the listener exits for any reason, and the worker then ends its session and exits (with a hard exit after 10 s if a call is stuck). On Windows, workers also run in a kill-on-close Job object. Spawned workers inherit only their IPC handles: Winsock sockets are inheritable by default, so the listening socket is excluded explicitly, and POSIX descriptors are close-on-exec.
 - Each worker runs as a low-privilege service account with no write access outside a per-session scratch directory. It is sandboxed (Linux: systemd sandboxing, seccomp, device allowlist; Windows: restricted token / AppContainer, to be evaluated). It has no outbound network access.
-- A crash or hang in a worker (for example from a malicious kernel, a driver fault, or a decoder bug) ends **only that session**. The listener and other sessions continue.
+- **[implemented, tested]** A crash or hang in a worker (for example from a malicious kernel, a driver fault, or a decoder bug) ends **only that session**. The listener and other sessions continue. The integration test kills one worker mid-session and checks that a concurrent session and new connections are unaffected.
 - GPUs are assigned to **one session at a time** in v1. Concurrent tenants on one GPU are out of scope until MPS/MIG-based isolation has been evaluated.
 
 ### What the server will and will not execute

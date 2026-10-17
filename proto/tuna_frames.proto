@@ -36,6 +36,13 @@ message Hello {
     uint32 cuda_driver_version = 3;   // server fills: cuDriverGetVersion()
     repeated DeviceInfo devices = 4;  // server fills
     bytes resume_token = 5;
+    // Server fills (Phase 2c): random per-session secret. The client presents
+    // it in the plaintext preamble of its bulk connection so the listener can
+    // route that socket to this session's worker; the worker then requires the
+    // bulk connection to pass mTLS as the same client identity.
+    bytes session_token = 6;
+    bool bulk_socket_available = 7;   // server fills: a bulk connection may be attached
+    uint32 worker_pid = 8;            // server fills: diagnostics only
 }
 
 message DeviceInfo {
@@ -66,4 +73,13 @@ message RpcResponse {
 // Async calls coalesced into one frame.
 message RpcBatch {
     repeated RpcRequest calls = 1;
+}
+
+// IO, channel 2: one chunk of a bulk payload referenced by an RpcRequest or
+// RpcResponse bulk_ref. Chunks of a transfer arrive in offset order.
+message BulkChunk {
+    uint64 bulk_ref = 1;
+    uint64 offset = 2;
+    uint64 total_size = 3;
+    bytes data = 4;
 }

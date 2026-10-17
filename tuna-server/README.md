@@ -5,7 +5,7 @@ One `tuna_server` binary, two tracks (see the [repository README](../README.md))
 | Track | What it is | How it is invoked | Status |
 |---|---|---|---|
 | **A — explicit workload API** | gRPC + mutual TLS service: `RemoteSumOfSquares`, `RemoteMatrixMultiply` (CUDA). Source: `src/workload/`. | `tuna_server --cert … --key … --client-ca … --allowed-client-san …` | Working MVP (CPU path CI-tested; GPU path awaiting RTX 3060 qualification). |
-| **B — CUDA driver-API remoting** | Server side of the `nvcuda.dll` shim design in `../docs/plans/2026-09-23-tuna-execution-plan.md`. Source: `src/core/`. | `tuna_server --foreground [--config PATH]` | Phase 1 (config + logging); transport arrives in Phase 2. |
+| **B — CUDA driver-API remoting** | Server side of the `nvcuda.dll` shim design in `../docs/plans/2026-09-23-tuna-execution-plan.md`. Source: `src/core/`, `src/remoting/`. | `tuna_server --foreground [--config PATH]` | Phase 2 done: mTLS 1.3, one worker process per session, bulk channel. CUDA dispatch arrives in Phase 3. |
 
 Track A is compiled in when `TUNA_SERVER_WORKLOAD_API=ON` (default on Linux, off on Windows because it needs gRPC). Everything below up to *Track B* documents Track A.
 
@@ -108,9 +108,9 @@ Open TCP/50051 only to trusted client networks. Validate certificate name/chain,
 
 NVIDIA references: [CUDA 12.8 Toolkit Release Notes — driver versions](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/index.html) and [CUDA Compatibility Guide](https://docs.nvidia.com/deploy/cuda-compatibility/).
 
-## Track B — remoting server core (`--foreground`)
+## Track B — remoting server (`--foreground`)
 
-Builds anywhere, with no gRPC dependency (pass `-DTUNA_SERVER_WORKLOAD_API=OFF` on Linux to build only this track). On Windows the documented toolchain is the Qt-bundled MinGW 13.1 + Ninja:
+Builds anywhere, with no gRPC dependency (pass `-DTUNA_SERVER_WORKLOAD_API=OFF` on Linux to build only this track). It needs OpenSSL 3.0 or newer (`libssl-dev` on Ubuntu; on Windows the [Shining Light](https://slproweb.com/products/Win32OpenSSL.html) "OpenSSL-Win64" install, which the MinGW build finds automatically). On Windows the documented toolchain is the Qt-bundled MinGW 13.1 + Ninja:
 
 ```bash
 cmake -S tuna-server -B tuna-server/build-ninja -G Ninja -DTUNA_SERVER_WORKLOAD_API=OFF
@@ -118,4 +118,60 @@ cmake --build tuna-server/build-ninja
 ctest --test-dir tuna-server/build-ninja --output-on-failure
 ```
 
-`tuna_server --foreground --config tuna-server.json` loads a JSON config (`listen_port`, `log_level`), writes a rotating log to `<temp>/tuna-server-logs/tuna-server.log`, and exits cleanly. The listener, per-session worker processes, and the v1 frame protocol (`../proto/tuna_frames.proto`) arrive in Phase 2. Its security model is the *Track B* section of `../tuna-guest-agent/docs/security_model.md`.
+### 1. Create certificates (mTLS)
+
+Track B is mutual TLS 1.3 only. The certificate tooling is built into the server binary. It uses EC P-256 keys and never overwrites an existing file:
+
+```bash
+tuna_server --gen-ca ./pki/ca                                    # ca.key (keep offline) + ca.crt
+# --san lists every name and IP address clients will dial
+tuna_server --issue-server-cert gpu-box --ca-dir ./pki/ca --out ./pki/server --san DNS:gpu-box,IP:10.0.0.5
+tuna_server --issue-client-cert alice --ca-dir ./pki/ca --out ./pki/alice   # SAN DNS:alice
+```
+
+Give the client `ca.crt`, `alice.crt` and `alice.key`. Generate a client's key on the client machine when you can. The CA key never needs to leave the operator's machine.
+
+### 2. Configure and run
+
+`tuna_server --foreground --config tuna-server.json` loads a JSON config, writes a rotating log to `<temp>/tuna-server-logs/tuna-server.log` (each worker writes `tuna-worker-<pid>.log`), and serves sessions until Ctrl-C (SIGINT/SIGTERM, or Ctrl-Break on Windows):
+
+```json
+{
+  "listen_port": 7443,
+  "listen_address": "0.0.0.0",
+  "log_level": "info",
+  "max_sessions": 8,
+  "tls": {
+    "ca_cert": "pki/ca/ca.crt",
+    "cert": "pki/server/gpu-box.crt",
+    "key": "pki/server/gpu-box.key",
+    "allowed_client_names": ["alice"]
+  }
+}
+```
+
+- `listen_port` is required, and `0` picks a free port. The server prints `listening on HOST:PORT` on stdout, and `session N worker PID` for each new session.
+- `tls` turns on mutual TLS 1.3. A client must present a certificate that chains to `ca_cert` **and** has a DNS/URI SAN listed in `allowed_client_names`, compared exactly. The allowlist cannot be empty. **Without `tls`, the server is plaintext and refuses any non-loopback `listen_address`**: plaintext GPU RPC must never reach a network. That mode is for development and tests.
+- `max_sessions` (default 8) caps concurrent sessions, including ones still handshaking. Connections over the cap are closed immediately.
+- `worker_mode` is `"process"` by default: every session runs in its own `tuna_server --worker` process, so a crash ends only that session. `"thread"` runs sessions inside the listener, for debugging only.
+
+### How a connection is served
+
+1. The listener reads a fixed 24-byte plaintext preamble (`TUNA`, kind, session token) and nothing else. It never runs TLS or parses an RPC.
+2. A *new session* connection goes to a freshly spawned worker. The socket is handed over with `SCM_RIGHTS` on Linux, or `WSADuplicateSocketW` on Windows.
+3. The worker runs TLS, verifies the client identity, and exchanges `Hello` (v1 frame protocol, `../proto/tuna_frames.proto`). Its `Hello` carries a random session token.
+4. The client opens a second connection with an *attach bulk* preamble and that token. The listener routes it to the same worker. The worker accepts it only if it passes mTLS as **the same client identity**. Payloads larger than one frame (16 MiB) then travel on this socket, in 1 MiB chunks, so they never block small RPCs.
+5. Heartbeat every 3 s, 10 s silence timeout. When the session ends, the worker exits. When the listener stops or dies, every worker sees EOF on its IPC channel and exits. On Windows, workers also sit in a kill-on-close Job object.
+
+Until Phase 3's CUDA dispatchers land, only the reserved diagnostic echo API (`api_id 0`) is served. Every other `api_id` returns `CUDA_ERROR_NOT_SUPPORTED`.
+
+Check a running server from the client side:
+
+```bash
+tuna_ping --host gpu-box --port 7443 --count 20 --bulk-mb 64 \
+          --ca pki/ca/ca.crt --cert pki/alice/alice.crt --key pki/alice/alice.key
+```
+
+`tuna_rpc_bench [--tls]` measures RPC latency, batched throughput and bulk throughput in-process. Both tools are built from the shared `../tunnel/` library.
+
+Its security model is the *Track B* section of `../tuna-guest-agent/docs/security_model.md`.

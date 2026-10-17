@@ -1,0 +1,38 @@
+# Pointer semantics for CUDA runtime functions that libclang cannot infer.
+# Each entry maps a parameter to how it crosses the wire:
+#   in_scalar   - value copied into the request (int, size_t, enum, ...)
+#   in_handle   - an opaque device pointer the server issued; sent as uint64
+#   out_scalar  - the function writes one scalar; returned in the response
+#   out_handle  - the function writes a device pointer (void**); returned as uint64
+#   out_struct  - the function writes a fixed-size struct; returned as bytes
+# A function listed with `special: NAME` is marshalled by hand (see
+# cuda_special.cpp) and the generator emits only its api_id.
+#
+# Functions NOT listed here are generated as stubs returning
+# cudaErrorNotSupported (3), so coverage grows as real apps show what they use.
+
+functions:
+  cudaGetDeviceCount:
+    count: out_scalar
+  cudaGetDevice:
+    device: out_scalar
+  cudaSetDevice:
+    device: in_scalar
+  cudaDeviceSynchronize: {}
+  # CUDA 12 redirects cudaGetDeviceProperties -> _v2 via a macro, so the real
+  # exported symbol (and the one the app's call resolves to) is the _v2 name.
+  cudaGetDeviceProperties_v2:
+    prop: out_struct
+    device: in_scalar
+  cudaMalloc:
+    devPtr: out_handle
+    size: in_scalar
+  cudaFree:
+    devPtr: in_handle
+  cudaMemGetInfo:
+    free: out_scalar
+    total: out_scalar
+
+special:
+  # kind decides direction, and the payload rides the bulk channel.
+  cudaMemcpy: memcpy
