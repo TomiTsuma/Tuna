@@ -4,10 +4,10 @@ Tuna lets a machine without a capable GPU use a remote server's GPU. Development
 
 | | **Track A — explicit workload API** | **Track B — CUDA driver-API remoting** |
 |---|---|---|
-| Idea | An application calls a typed Tuna RPC (`RemoteSumOfSquares`, `RemoteMatrixMultiply`), and the server runs a fixed, bounded workload. | Unmodified CUDA apps (CUDA samples, PyTorch) load a replacement `nvcuda.dll`. Their driver API calls are forwarded to a per-session worker that runs them on the server's real GPU. |
+| Idea | An application calls a typed Tuna RPC (`RemoteSumOfSquares`, `RemoteMatrixMultiply`), and the server runs a fixed, bounded workload. | Unmodified CUDA apps (CUDA samples, later PyTorch) load a replacement CUDA runtime (`libcudart`). Their runtime API calls are forwarded to a per-session worker that runs them on the server's real GPU. |
 | Transport | gRPC over mutual TLS | v1 length-prefixed protobuf frames over TCP + TLS 1.3 (msquic later) |
 | Contract | [`proto/tuna/v1/workload.proto`](proto/tuna/v1/workload.proto) | [`proto/tuna_frames.proto`](proto/tuna_frames.proto) |
-| Status | **Working MVP**: Windows client and GUI, Linux server, CPU path and mTLS tested. The GPU path still needs qualification on RTX 3060 hardware. | **Phase 2 done**: `tunnel/` (framing, TCP + mTLS 1.3 transports, handshake, heartbeat, batched RPC, bulk channel), certificate tooling, per-session worker processes. **Phase 3a in progress** (`cuda/`): CUDA runtime-API codegen + marshalling, and a first call driving a real GPU through the generated dispatch. Approach is **B2** (replace `libcudart`, Linux client first) — see `docs/plans/2026-10-16-phase3-spike-findings.md`. |
+| Status | **Working MVP**: Windows client and GUI, Linux server, CPU path and mTLS tested. The GPU path still needs qualification on RTX 3060 hardware. | **Phases 2–3c done**: `tunnel/` (framing, TCP + mTLS 1.3, handshake, heartbeat, batched RPC, bulk channel), certificate tooling, per-session worker processes; `cuda/`: a replacement `libcudart.so.12` / `cudart64_12.dll` (full CUDA 12 runtime ABI, generated stubs) that forwards the runtime API, kernel launches and `__constant__` symbols to the server. **Unmodified nvcc-built programs (deviceQuery, vectorAdd, matrixMul) run on a real GPU through Tuna**, over plaintext loopback and mTLS. Approach **B2** (replace `libcudart`) — see `docs/plans/2026-10-16-phase3-spike-findings.md` and [`cuda/README.md`](cuda/README.md). |
 | Plan | [`tuna-guest-agent/docs/implementation_plan.md`](tuna-guest-agent/docs/implementation_plan.md) | [`docs/plans/2026-09-23-tuna-execution-plan.md`](docs/plans/2026-09-23-tuna-execution-plan.md) |
 
 The tracks are complementary. Track A gives a secure, usable product today, for workloads that can be expressed as explicit calls. Track B is the longer bet on transparent acceleration. It reuses Track A's security posture (mTLS, a dedicated CA, identity allowlists), and it goes further because clients there run arbitrary GPU code. Both are covered in [the security model](tuna-guest-agent/docs/security_model.md).
@@ -20,6 +20,8 @@ cmake/                 Shared CMake helpers (protobuf + frame-proto library)
 tuna-guest-agent/      Windows client: Qt GUI, gRPC sample client, Track B core, tests, docs
 tuna-server/           Server: one `tuna_server` binary, Track A (src/workload) + Track B (src/core, src/remoting)
 tunnel/                Track B transport + RPC runtime shared by client and server, plus tuna_ping / tuna_rpc_bench
+cuda/                  Track B CUDA runtime remoting: client shim (libcudart replacement), server dispatch, samples
+tools/codegen/         Generates the CUDA stubs from cuda_runtime_api.h + annotations.yaml
 docs/plans/            Track B execution plan and earlier design history
 docs/changelog/        Per-change engineering log
 .github/workflows/     CI: Windows client, Windows server core, Linux client+server (Ubuntu 22.04/24.04)

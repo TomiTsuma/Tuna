@@ -99,3 +99,44 @@ jobs:
 
       - name: Run unit and mTLS integration tests
         run: ctest --test-dir build --output-on-failure
+
+  # Track B CUDA runtime remoting (Phase 3), GPU-free: the shim
+  # (libcudart.so.12), tuna_server with CUDA dispatch, the marshalling tests and
+  # the end-to-end test against the mock CUDA stack. Needs only NVIDIA's
+  # redistributable CUDA 12 headers, not a GPU or a driver.
+  linux-cuda-remoting:
+    runs-on: ubuntu-24.04
+    env:
+      CUDA_REDIST: https://developer.download.nvidia.com/compute/cuda/redist
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev python3 python3-pip
+          python3 -m pip install --user --break-system-packages libclang==18.1.1 PyYAML
+
+      - name: Fetch CUDA 12.8 headers (NVIDIA redistributables)
+        run: |
+          mkdir -p "$HOME/cuda"
+          for pkg in cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-12.8.90-archive.tar.xz \
+                     cuda_nvcc/linux-x86_64/cuda_nvcc-linux-x86_64-12.8.93-archive.tar.xz; do
+            curl -sSfL "$CUDA_REDIST/$pkg" | tar -xJ --strip-components=1 -C "$HOME/cuda"
+          done
+
+      - name: Committed codegen output is current
+        run: |
+          python3 tools/codegen/gen_cuda.py "$HOME/cuda/include" tools/codegen/annotations.yaml cuda/generated
+          git diff --exit-code -- cuda/generated tools/codegen/api_ids.yaml
+
+      - name: Configure server with the CUDA shim
+        run: |
+          cmake -S tuna-server -B build-cuda -DTUNA_SERVER_WORKLOAD_API=OFF -DTUNA_BUILD_CUDA_SHIM=ON \
+            -DTUNA_CUDA_INCLUDE_DIR="$HOME/cuda/include" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-cuda --parallel
+
+      - name: Run tests (unit, marshalling, CUDA end-to-end over TCP and mTLS)
+        run: ctest --test-dir build-cuda --output-on-failure

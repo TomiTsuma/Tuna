@@ -1,0 +1,57 @@
+# Append-only api_id registry for remoted CUDA runtime calls.
+# gen_cuda.py adds new names at the end. Never renumber or reuse an id:
+# clients and servers of different versions agree on calls by id.
+# 0 is reserved for the tunnel's echo call.
+cudaDeviceSynchronize: 1
+cudaFree: 2
+cudaGetDevice: 3
+cudaGetDeviceCount: 4
+cudaGetDeviceProperties_v2: 5
+cudaMalloc: 6
+cudaMemGetInfo: 7
+cudaMemcpy: 8
+cudaSetDevice: 9
+__tunaFuncGetAttributes: 10
+__tunaFuncSetAttribute: 11
+__tunaGetFunction: 12
+__tunaGetVar: 13
+__tunaLaunchKernel: 14
+__tunaOccupancy: 15
+__tunaRegisterModule: 16
+cudaChooseDevice: 17
+cudaDeviceCanAccessPeer: 18
+cudaDeviceGetAttribute: 19
+cudaDeviceGetCacheConfig: 20
+cudaDeviceGetLimit: 21
+cudaDeviceGetStreamPriorityRange: 22
+cudaDeviceReset: 23
+cudaDeviceSetCacheConfig: 24
+cudaDeviceSetLimit: 25
+cudaDriverGetVersion: 26
+cudaEventCreate: 27
+cudaEventCreateWithFlags: 28
+cudaEventDestroy: 29
+cudaEventElapsedTime: 30
+cudaEventQuery: 31
+cudaEventRecord: 32
+cudaEventRecordWithFlags: 33
+cudaEventSynchronize: 34
+cudaGetDeviceFlags: 35
+cudaGetLastError: 36
+cudaMallocPitch: 37
+cudaMemcpyAsync: 38
+cudaMemset: 39
+cudaMemset2D: 40
+cudaMemsetAsync: 41
+cudaPeekAtLastError: 42
+cudaPointerGetAttributes: 43
+cudaSetDeviceFlags: 44
+cudaStreamCreate: 45
+cudaStreamCreateWithFlags: 46
+cudaStreamCreateWithPriority: 47
+cudaStreamDestroy: 48
+cudaStreamGetFlags: 49
+cudaStreamGetPriority: 50
+cudaStreamQuery: 51
+cudaStreamSynchronize: 52
+cudaStreamWaitEvent: 53

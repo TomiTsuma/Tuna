@@ -39,6 +39,12 @@ std::optional<ServerConfig> ConfigManager::LoadFromFile(const std::string& path)
             config.worker_mode = parsed.at("worker_mode").get<std::string>();
             if (config.worker_mode != "process" && config.worker_mode != "thread") return std::nullopt;
         }
+        if (parsed.contains("cuda")) {
+            const auto& cuda = parsed.at("cuda");
+            config.cuda.enabled = cuda.value("enabled", true);
+            config.cuda.runtime_library = cuda.value("runtime_library", std::string());
+            config.cuda.driver_library = cuda.value("driver_library", std::string());
+        }
         if (parsed.contains("tls")) {
             const auto& tls = parsed.at("tls");
             ServerTlsConfig t;

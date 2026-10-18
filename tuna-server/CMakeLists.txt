@@ -24,6 +24,12 @@ if(TUNA_ENABLE_CUDA AND NOT TUNA_SERVER_WORKLOAD_API)
     message(FATAL_ERROR "TUNA_ENABLE_CUDA requires TUNA_SERVER_WORKLOAD_API=ON.")
 endif()
 
+# The CUDA shim links the tunnel and protobuf statically into a shared
+# library (libcudart.so.12), so everything it pulls in must be PIC.
+if(TUNA_BUILD_CUDA_SHIM)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 if(TUNA_SERVER_WORKLOAD_API)
     set(TUNA_SYSTEM_PROTOBUF ON)  # gRPC is in the build; see cmake/TunaProtobuf.cmake
 endif()
@@ -124,6 +130,11 @@ add_executable(tuna_server
     src/remoting/dispatch.cpp
 )
 target_link_libraries(tuna_server PRIVATE tuna_server_core tuna_tunnel)
+if(TUNA_BUILD_CUDA_SHIM)
+    # Track B CUDA remoting: per-session CudaSession over the real CUDA stack.
+    target_link_libraries(tuna_server PRIVATE tuna_cuda_backend_real)
+    target_compile_definitions(tuna_server PRIVATE TUNA_SERVER_CUDA=1)
+endif()
 target_compile_options(tuna_server PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 if(TUNA_SERVER_WORKLOAD_API)
     target_link_libraries(tuna_server PRIVATE tuna_workload)

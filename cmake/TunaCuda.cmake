@@ -1,14 +1,18 @@
-# Track B CUDA runtime-API remoting (Phase 3). Opt-in: it needs the CUDA
-# runtime headers and a Python with libclang + PyYAML for codegen.
+# Track B CUDA runtime-API remoting (Phase 3). Opt-in: it needs the CUDA 12
+# runtime headers (not a GPU, and not the CUDA compiler).
 #
 # Provides (when TUNA_BUILD_CUDA_SHIM=ON):
-#   tuna_cuda_dispatch   server-side dispatcher (links into tuna_server)
-#   tuna_cuda_client     client shim object (the replacement libcudart)
-#   tuna_add_cuda_tests()  registers the marshalling round-trip test
+#   tuna_cuda_dispatch      server-side CudaSession (links into tuna_server)
+#   tuna_cuda_backend_real  dlopen of NVIDIA's libcudart + libcuda (server)
+#   tuna_cuda_client        client shim objects
+#   tuna_cudart             the client shim as a shared library:
+#                           <build>/shim/libcudart.so.12 (Linux) or
+#                           <build>/shim/cudart64_12.dll (Windows)
+#   tuna_mock_cuda          a mock CUDA stack the server can load (tests)
+#   tuna_add_cuda_tests()   marshalling test + GPU-free end-to-end test
 #
-# Only the headers are needed to build and test marshalling (the dispatcher
-# calls the real runtime through a resolved pointer, mocked in tests), so this
-# builds and its test runs on a box with no GPU.
+# Before including this file, set CMAKE_POSITION_INDEPENDENT_CODE ON (the
+# shim links the tunnel and protobuf statically into a shared library).
 include_guard(GLOBAL)
 
 option(TUNA_BUILD_CUDA_SHIM "Build the Track B CUDA runtime-API shim (needs CUDA headers)" OFF)
@@ -51,20 +55,20 @@ endif()
 # them (into the build tree) with -DTUNA_REGEN_CUDA=ON; commit the result by
 # re-running tools/codegen/gen_cuda.py into cuda/generated/.
 option(TUNA_REGEN_CUDA "Regenerate the CUDA stubs with libclang instead of using the committed ones" OFF)
+set(_tuna_cuda_gen_names
+    cuda_api_ids.h cuda_client_stubs.inc cuda_server_dispatch.inc cuda_unsupported_stubs.inc
+    cuda_error_strings.inc cuda_coverage.inc)
 if(TUNA_REGEN_CUDA)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(TUNA_CUDA_GEN_DIR "${CMAKE_BINARY_DIR}/generated/cuda")
-    set(TUNA_CUDA_GENERATED
-        "${TUNA_CUDA_GEN_DIR}/cuda_api_ids.h"
-        "${TUNA_CUDA_GEN_DIR}/cuda_client_stubs.inc"
-        "${TUNA_CUDA_GEN_DIR}/cuda_server_dispatch.inc"
-        "${TUNA_CUDA_GEN_DIR}/cuda_coverage.inc")
+    list(TRANSFORM _tuna_cuda_gen_names PREPEND "${TUNA_CUDA_GEN_DIR}/" OUTPUT_VARIABLE TUNA_CUDA_GENERATED)
     add_custom_command(
         OUTPUT ${TUNA_CUDA_GENERATED}
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${TUNA_CUDA_GEN_DIR}"
         COMMAND "${Python3_EXECUTABLE}" "${TUNA_CODEGEN_DIR}/gen_cuda.py"
                 "${TUNA_CUDA_INCLUDE_DIR}" "${TUNA_CODEGEN_DIR}/annotations.yaml" "${TUNA_CUDA_GEN_DIR}"
         DEPENDS "${TUNA_CODEGEN_DIR}/gen_cuda.py" "${TUNA_CODEGEN_DIR}/annotations.yaml"
+                "${TUNA_CODEGEN_DIR}/cudart12_exports.txt"
         COMMENT "Generating CUDA runtime remoting stubs"
         VERBATIM)
     add_custom_target(tuna_cuda_codegen DEPENDS ${TUNA_CUDA_GENERATED})
@@ -73,34 +77,66 @@ else()
     add_custom_target(tuna_cuda_codegen)  # nothing to do; stubs are committed
 endif()
 
+set(_tuna_cuda_includes ${TUNA_CUDA_DIR}/include ${TUNA_CUDA_GEN_DIR} ${TUNA_CUDA_INCLUDE_DIR})
+set(_tuna_cuda_warnings $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
+
 # Server-side dispatcher.
 add_library(tuna_cuda_dispatch STATIC ${TUNA_CUDA_DIR}/src/dispatch.cpp)
 add_dependencies(tuna_cuda_dispatch tuna_cuda_codegen)
-target_include_directories(tuna_cuda_dispatch PUBLIC
-    ${TUNA_CUDA_DIR}/include ${TUNA_CUDA_GEN_DIR} ${TUNA_CUDA_INCLUDE_DIR})
+target_include_directories(tuna_cuda_dispatch PUBLIC ${_tuna_cuda_includes})
 target_link_libraries(tuna_cuda_dispatch PUBLIC tuna_tunnel tuna_proto)
+target_compile_options(tuna_cuda_dispatch PRIVATE ${_tuna_cuda_warnings})
 
-# Client shim (the replacement libcudart). Built as an object library so it can
-# go into either the test or a standalone shared library.
-add_library(tuna_cuda_client OBJECT ${TUNA_CUDA_DIR}/src/client.cpp)
-add_dependencies(tuna_cuda_client tuna_cuda_codegen)
-target_include_directories(tuna_cuda_client PUBLIC
-    ${TUNA_CUDA_DIR}/include ${TUNA_CUDA_GEN_DIR} ${TUNA_CUDA_INCLUDE_DIR})
-target_link_libraries(tuna_cuda_client PUBLIC tuna_tunnel tuna_proto)
-
-# Production backend: resolves symbols from the real libcudart at runtime.
+# Production backend: resolves symbols from the real libcudart/libcuda at runtime.
 add_library(tuna_cuda_backend_real STATIC ${TUNA_CUDA_DIR}/src/backend_real.cpp)
 add_dependencies(tuna_cuda_backend_real tuna_cuda_codegen)
-target_include_directories(tuna_cuda_backend_real PUBLIC
-    ${TUNA_CUDA_DIR}/include ${TUNA_CUDA_GEN_DIR} ${TUNA_CUDA_INCLUDE_DIR})
 target_link_libraries(tuna_cuda_backend_real PUBLIC tuna_cuda_dispatch)
+target_compile_options(tuna_cuda_backend_real PRIVATE ${_tuna_cuda_warnings})
 if(UNIX)
     target_link_libraries(tuna_cuda_backend_real PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
-# Real-GPU probe: drives the GPU through the generated dispatch in-process.
-# Builds without a GPU (libcudart is dlopen'd); running it needs one, so it is
-# not registered as a ctest.
+# Client shim objects (the replacement libcudart). An object library, so the
+# same code goes into the shared library and into the in-process tests.
+add_library(tuna_cuda_client OBJECT
+    ${TUNA_CUDA_DIR}/src/client.cpp
+    ${TUNA_CUDA_DIR}/src/client_runtime.cpp
+    ${TUNA_CUDA_DIR}/src/client_launch.cpp
+    ${TUNA_CUDA_DIR}/src/client_unsupported.cpp)
+add_dependencies(tuna_cuda_client tuna_cuda_codegen)
+target_include_directories(tuna_cuda_client PUBLIC ${_tuna_cuda_includes})
+target_link_libraries(tuna_cuda_client PUBLIC tuna_tunnel tuna_proto)
+target_compile_options(tuna_cuda_client PRIVATE ${_tuna_cuda_warnings})
+
+# The shim as the runtime library itself. Programs built against NVIDIA's
+# runtime (`nvcc -cudart shared`, PyTorch) load it in place of the real one
+# via LD_LIBRARY_PATH / the DLL search path; `tuna run` sets that up.
+add_library(tuna_cudart SHARED $<TARGET_OBJECTS:tuna_cuda_client>)
+target_link_libraries(tuna_cudart PRIVATE tuna_tunnel tuna_proto)
+set_target_properties(tuna_cudart PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shim"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shim")
+if(WIN32)
+    set_target_properties(tuna_cudart PROPERTIES OUTPUT_NAME cudart64_12 PREFIX "")
+else()
+    # libcudart.so.12 with NVIDIA's symbol version node; only the CUDA API is
+    # exported (see cuda/libcudart.map).
+    set_target_properties(tuna_cudart PROPERTIES OUTPUT_NAME cudart VERSION 12 SOVERSION 12)
+    target_link_options(tuna_cudart PRIVATE
+        "LINKER:--version-script=${TUNA_CUDA_DIR}/libcudart.map" "LINKER:--no-undefined")
+    set_property(TARGET tuna_cudart APPEND PROPERTY LINK_DEPENDS "${TUNA_CUDA_DIR}/libcudart.map")
+endif()
+
+# A mock CUDA stack for tuna_server (runtime_library in its config), so the
+# end-to-end test runs on machines with no GPU.
+add_library(tuna_mock_cuda SHARED ${TUNA_CUDA_DIR}/tests/mock_cuda.cpp)
+target_include_directories(tuna_mock_cuda PRIVATE ${TUNA_CUDA_INCLUDE_DIR})
+set_target_properties(tuna_mock_cuda PROPERTIES CXX_VISIBILITY_PRESET hidden)
+target_compile_options(tuna_mock_cuda PRIVATE ${_tuna_cuda_warnings})
+
+# Real-GPU probe: drives the GPU through the dispatch in-process. Builds
+# without a GPU (libcudart is dlopen'd); running it needs one, so it is not a
+# ctest.
 add_executable(tuna_cuda_real_probe ${TUNA_CUDA_DIR}/tests/real_gpu_probe.cpp
                $<TARGET_OBJECTS:tuna_cuda_client>)
 target_link_libraries(tuna_cuda_real_probe PRIVATE tuna_cuda_backend_real tuna_cuda_client)
@@ -109,7 +145,23 @@ function(tuna_add_cuda_tests)
     if(TARGET tuna_cuda_tests)
         return()
     endif()
-    add_executable(tuna_cuda_tests ${TUNA_CUDA_DIR}/tests/test_marshal.cpp $<TARGET_OBJECTS:tuna_cuda_client>)
+    add_executable(tuna_cuda_tests ${TUNA_CUDA_DIR}/tests/test_marshal.cpp ${TUNA_CUDA_DIR}/tests/mock_cuda.cpp
+                   $<TARGET_OBJECTS:tuna_cuda_client>)
     target_link_libraries(tuna_cuda_tests PRIVATE Catch2::Catch2WithMain tuna_cuda_dispatch tuna_cuda_client)
     catch_discover_tests(tuna_cuda_tests TEST_PREFIX "cuda: ")
+
+    # A program linked against the shim, exactly as an nvcc-built app links
+    # libcudart: it registers a fatbin and launches kernels over the network.
+    add_executable(tuna_cuda_e2e_client ${TUNA_CUDA_DIR}/tests/e2e_client.cpp)
+    target_include_directories(tuna_cuda_e2e_client PRIVATE ${TUNA_CUDA_INCLUDE_DIR})
+    target_link_libraries(tuna_cuda_e2e_client PRIVATE tuna_cudart)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND AND TARGET tuna_server)
+        add_test(NAME tuna_cuda_e2e
+            COMMAND "${Python3_EXECUTABLE}" "${TUNA_CUDA_DIR}/tests/integration/test_cuda_e2e.py"
+                "$<TARGET_FILE:tuna_server>" "$<TARGET_FILE:tuna_cuda_e2e_client>"
+                "$<TARGET_FILE:tuna_mock_cuda>" "$<TARGET_FILE_DIR:tuna_cudart>")
+        set_tests_properties(tuna_cuda_e2e PROPERTIES TIMEOUT 120)
+    endif()
 endfunction()

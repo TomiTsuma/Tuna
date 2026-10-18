@@ -1,6 +1,11 @@
 #pragma once
 
+#include <cstdint>
+#include <map>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "tuna/cuda/marshal.h"
 #include "tuna/tunnel/rpc.h"
@@ -8,9 +13,10 @@
 
 namespace tuna::cudart {
 
-// The real CUDA runtime, as the server dispatcher sees it. The production
-// backend dlopen/LoadLibrary's libcudart and returns dlsym addresses; tests
-// supply a mock whose Resolve() returns pointers to stand-in functions.
+// The real CUDA stack, as the server dispatcher sees it: runtime symbols
+// (cudaMalloc, ...) and the few driver symbols kernel launch needs
+// (cuModuleLoadData, cuLaunchKernel, ...). The production backend dlopen's
+// libcudart + libcuda; tests supply a mock whose Resolve() returns stand-ins.
 class CudaBackend {
 public:
     virtual ~CudaBackend() = default;
@@ -18,15 +24,67 @@ public:
     virtual void* Resolve(const char* symbol) = 0;
 };
 
-// Executes one remoted runtime call. Reads request.args() (and `bulk_in` for
-// host->device copies), calls the real function through `backend`, and returns
-// the response (with `bulk_out` set for device->host copies). Never throws:
-// a malformed request becomes cudaErrorInvalidValue.
-RpcResponse CudaDispatch(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out,
-                         CudaBackend& backend);
+// One client session's CUDA state on the server: uploaded fatbin images, the
+// kernels resolved from them, and which modules are loaded into which CUDA
+// context. Lives in the per-session worker process, so a session's GPU state
+// dies with its worker.
+//
+// Not thread-safe: RpcServer dispatches one call at a time, in order.
+class CudaSession {
+public:
+    explicit CudaSession(CudaBackend& backend) : backend_(backend) {}
 
-// True if `api_id` is a CUDA runtime call this build knows (not the echo id
-// and not an unannotated function).
+    // Executes one remoted runtime call. Reads request.args() (and `bulk_in`
+    // for host->device copies and module uploads), calls the real function
+    // through the backend, and returns the response (with `bulk_out` set for
+    // device->host copies). Never throws: a malformed request becomes
+    // cudaErrorInvalidValue.
+    RpcResponse Dispatch(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out);
+
+    size_t module_count() const { return images_.size(); }
+
+private:
+    struct Image {
+        std::vector<uint64_t> words;  // 8-byte aligned copy of the fatbin
+    };
+    struct Function {
+        uint64_t module;   // 1-based index into images_
+        std::string name;
+        std::vector<std::pair<uint32_t, uint32_t>> params;  // (offset, size)
+        size_t param_bytes = 0;
+    };
+    using Context = void*;  // CUcontext
+
+    bool DispatchSpecial(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out,
+                         RpcResponse& resp);
+    void Memcpy(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out, RpcResponse& resp);
+    void Reset(RpcResponse& resp);
+    void RegisterModule(const std::string& bulk_in, RpcResponse& resp);
+    void GetFunction(const RpcRequest& request, RpcResponse& resp);
+    void GetVar(const RpcRequest& request, RpcResponse& resp);
+    void LaunchKernel(const RpcRequest& request, RpcResponse& resp);
+    void FuncCall(const RpcRequest& request, RpcResponse& resp);
+
+    // The current CUDA context (initializing the runtime's primary context
+    // first), or nullptr with *error set.
+    Context CurrentContext(int32_t* error);
+    // `module` loaded into the current context, loading it on first use.
+    int32_t LoadedModule(uint64_t module, Context ctx, void** cu_module);
+    // Function `id` (1-based) resolved in the current context.
+    int32_t ResolvedFunction(uint64_t id, void** cu_function);
+
+    CudaBackend& backend_;
+    std::vector<Image> images_;
+    std::vector<Function> functions_;
+    std::map<std::pair<uint64_t, std::string>, uint64_t> function_ids_;  // (module, name) -> id
+    std::map<std::pair<Context, uint64_t>, void*> loaded_;    // (ctx, module) -> CUmodule
+    std::map<std::pair<Context, uint64_t>, void*> resolved_;  // (ctx, function) -> CUfunction
+};
+
+// True if `api_id` is a CUDA call this build knows (not the echo id).
 bool IsCudaApi(uint32_t api_id);
+
+// The api's name for logs ("api#<id>" if unknown).
+std::string CudaApiName(uint32_t api_id);
 
 }  // namespace tuna::cudart

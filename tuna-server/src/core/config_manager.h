@@ -15,6 +15,14 @@ struct ServerTlsConfig {
     std::vector<std::string> allowed_client_names;  // exact DNS/URI SAN values; required
 };
 
+// Track B CUDA remoting (`"cuda": {...}`). Each session's worker opens the
+// real CUDA stack on its first CUDA call.
+struct ServerCudaConfig {
+    bool enabled = true;
+    std::string runtime_library;  // NVIDIA libcudart; empty = libcudart.so.12 / cudart64_12.dll
+    std::string driver_library;   // NVIDIA libcuda; empty = libcuda.so.1 / nvcuda.dll
+};
+
 struct ServerConfig {
     uint16_t listen_port = 0;
     // Loopback by default. Without `tls` the server refuses non-loopback
@@ -30,6 +38,7 @@ struct ServerConfig {
     // run inside the listener, for debugging only - a crashing session then
     // takes the listener down with it.
     std::string worker_mode = "process";
+    ServerCudaConfig cuda;
 };
 
 class ConfigManager {

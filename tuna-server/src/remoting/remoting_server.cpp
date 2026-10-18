@@ -125,8 +125,8 @@ private:
 class ThreadSessionHost final : public SessionHost {
 public:
     ThreadSessionHost(uint64_t id, std::shared_ptr<tunnel::TlsContext> tls, tunnel::SessionToken token,
-                      std::shared_ptr<spdlog::logger> log)
-        : session_(id, std::move(tls), token, std::move(log)) {}
+                      std::shared_ptr<spdlog::logger> log, ServerCudaConfig cuda)
+        : session_(id, std::move(tls), token, std::move(log), std::move(cuda)) {}
     ~ThreadSessionHost() override { Join(); }
 
     bool Start(tunnel::TcpStream stream) override {
@@ -244,7 +244,7 @@ private:
             }
             id = next_id_++;
             if (config_.worker_mode == "thread") {
-                host = std::make_shared<ThreadSessionHost>(id, tls_, token, log_);
+                host = std::make_shared<ThreadSessionHost>(id, tls_, token, log_, config_.cuda);
             } else {
                 host = std::make_shared<ProcessSessionHost>(id, token, executable_, config_path_, log_);
             }

@@ -20,6 +20,16 @@ public:
         for (int i = 0; i < 8; ++i) bytes[i] = static_cast<char>((value >> (8 * i)) & 0xff);
         buffer_.append(bytes, 8);
     }
+    void put_u32(uint32_t value) {
+        char bytes[4];
+        for (int i = 0; i < 4; ++i) bytes[i] = static_cast<char>((value >> (8 * i)) & 0xff);
+        buffer_.append(bytes, 4);
+    }
+    // Length-prefixed (u32) bytes, e.g. a kernel or symbol name.
+    void put_string(const std::string& value) {
+        put_u32(static_cast<uint32_t>(value.size()));
+        buffer_.append(value);
+    }
     const std::string& str() const { return buffer_; }
 
 private:
@@ -44,6 +54,30 @@ public:
         uint64_t value = 0;
         for (int i = 0; i < 8; ++i) value |= static_cast<uint64_t>(bytes[i]) << (8 * i);
         return value;
+    }
+    uint32_t get_u32() {
+        unsigned char bytes[4];
+        get(bytes, 4);
+        uint32_t value = 0;
+        for (int i = 0; i < 4; ++i) value |= static_cast<uint32_t>(bytes[i]) << (8 * i);
+        return value;
+    }
+    std::string get_string() {
+        const uint32_t size = get_u32();
+        if (size > remaining()) throw std::runtime_error("cuda arg buffer underrun");
+        std::string value = data_.substr(offset_, size);
+        offset_ += size;
+        return value;
+    }
+    // The unread tail (e.g. a kernel's packed parameters).
+    std::string rest() {
+        std::string value = data_.substr(offset_);
+        offset_ = data_.size();
+        return value;
+    }
+    void skip(size_t size) {
+        if (offset_ + size > data_.size()) throw std::runtime_error("cuda arg buffer underrun");
+        offset_ += size;
     }
     size_t remaining() const { return data_.size() - offset_; }
 

@@ -26,8 +26,8 @@ constexpr auto kHandshakeTimeout = std::chrono::seconds(5);
 }  // namespace
 
 WorkerSession::WorkerSession(uint64_t id, std::shared_ptr<tunnel::TlsContext> tls, tunnel::SessionToken token,
-                             std::shared_ptr<spdlog::logger> log)
-    : id_(id), tls_(std::move(tls)), token_(token), log_(std::move(log)) {}
+                             std::shared_ptr<spdlog::logger> log, ServerCudaConfig cuda)
+    : id_(id), tls_(std::move(tls)), token_(token), log_(std::move(log)), cuda_(std::move(cuda)) {}
 
 std::unique_ptr<tunnel::Transport> WorkerSession::Secure(tunnel::TcpStream stream, std::string* identity,
                                                          std::string* error) {
@@ -60,7 +60,7 @@ void WorkerSession::RunMain(tunnel::TcpStream stream) {
     log_->info("session {}: connected (identity='{}', client_os='{}')", id_,
                identity.empty() ? "<plaintext>" : identity, peer->client_os());
 
-    tunnel::RpcServer server(*transport, MakeDispatcher(log_));
+    tunnel::RpcServer server(*transport, MakeDispatcher(log_, cuda_));
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopped_) {
@@ -163,7 +163,7 @@ int RunWorker(const std::string& config_path, const std::string& ack_handle) {
         log->error("worker: no session socket received");
         return 1;
     }
-    WorkerSession session(getpid(), tls, first->first.token, log);
+    WorkerSession session(getpid(), tls, first->first.token, log, config->cuda);
 
     // Later handoffs are bulk sockets. EOF means the listener stopped us or
     // died: end the session, and if it cannot end (a thread stuck inside a

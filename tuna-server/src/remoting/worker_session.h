@@ -7,6 +7,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/config_manager.h"
 #include "tuna/tunnel/client.h"
 #include "tuna/tunnel/rpc.h"
 #include "tuna/tunnel/tcp_socket.h"
@@ -22,7 +23,7 @@ class WorkerSession {
 public:
     // `tls` is null for a plaintext (loopback-only) server.
     WorkerSession(uint64_t id, std::shared_ptr<tunnel::TlsContext> tls, tunnel::SessionToken token,
-                  std::shared_ptr<spdlog::logger> log);
+                  std::shared_ptr<spdlog::logger> log, ServerCudaConfig cuda = {});
 
     // Handshakes on the session socket and serves RPCs until the client
     // disconnects, the session is stopped, or the peer violates the protocol.
@@ -43,6 +44,7 @@ private:
     const std::shared_ptr<tunnel::TlsContext> tls_;
     const tunnel::SessionToken token_;
     const std::shared_ptr<spdlog::logger> log_;
+    const ServerCudaConfig cuda_;
 
     std::mutex mutex_;
     std::condition_variable serving_cv_;  // signalled when server_ is set or the session ends
