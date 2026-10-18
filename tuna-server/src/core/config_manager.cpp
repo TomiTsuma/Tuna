@@ -44,6 +44,7 @@ std::optional<ServerConfig> ConfigManager::LoadFromFile(const std::string& path)
             config.cuda.enabled = cuda.value("enabled", true);
             config.cuda.runtime_library = cuda.value("runtime_library", std::string());
             config.cuda.driver_library = cuda.value("driver_library", std::string());
+            config.cuda.cublas_library = cuda.value("cublas_library", std::string());
         }
         if (parsed.contains("tls")) {
             const auto& tls = parsed.at("tls");

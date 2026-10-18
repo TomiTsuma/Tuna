@@ -1,0 +1,99 @@
+# Pointer semantics for cuBLAS (cublas_api.h) functions remoted by Tuna's
+# replacement libcublas. Same roles and flags as annotations.yaml, plus two
+# for cuBLAS scalars, whose meaning depends on the handle's pointer mode
+# (cublasSetPointerMode): host memory by default, device memory when the app
+# switched the handle to CUBLAS_POINTER_MODE_DEVICE.
+#   in_scalar_ref   a const pointer to one scalar (alpha, beta): its value is
+#                   copied in host mode, its device address sent in device mode.
+#                   "in_scalar_ref(expr)" sizes a `const void*` scalar by a C++
+#                   expression over the other parameters (GemmEx: its compute
+#                   type, and Ctype for complex).
+#   out_scalar_ref  a pointer the function writes one scalar to (dot, nrm2):
+#                   returned in the reply in host mode; written on the device
+#                   in device mode.
+# Every function that uses a *_ref role must have a `handle` parameter.
+#
+# Server-side handle checks: a cublasHandle_t is a host pointer in the worker,
+# so the server keeps its own table of the handles it created (and each one's
+# pointer mode) and refuses any other value. `_server_by_hand: true` marks the
+# calls that maintain that table; their server cases are in dispatch_cublas.cpp
+# (the client stub is still generated).
+#
+# BLAS calls are `_async` (fire-and-forget, like the kernel launches they
+# are): ordering with the CUDA runtime calls is kept because both go down the
+# same session in order. A failure surfaces at the next synchronizing CUDA
+# call (as the matching cudaError_t), the way a failed kernel launch does.
+#
+# special: hand-written (cuda/src/cublas_client.cpp, cuda/src/dispatch_cublas.cpp)
+# local:   implemented in the client shim only
+# Every other libcublas export (cublas12_exports.txt) is generated as a stub
+# returning CUBLAS_STATUS_NOT_SUPPORTED.
+
+functions:
+  # --- handle and configuration
+  cublasCreate_v2: {_wrap: true, _server_by_hand: true, handle: out_handle}
+  cublasDestroy_v2: {_wrap: true, _server_by_hand: true, handle: in_handle}
+  cublasGetVersion_v2: {handle: in_handle, version: out_scalar}
+  cublasGetProperty: {type: in_scalar, value: out_scalar}
+  cublasSetStream_v2: {_async: true, handle: in_handle, streamId: in_handle}
+  cublasGetStream_v2: {handle: in_handle, streamId: out_handle}
+  cublasSetWorkspace_v2: {_async: true, handle: in_handle, workspace: in_handle, workspaceSizeInBytes: in_scalar}
+  cublasSetPointerMode_v2: {_wrap: true, _server_by_hand: true, _async: true, handle: in_handle, mode: in_scalar}
+  cublasSetMathMode: {_async: true, handle: in_handle, mode: in_scalar}
+  cublasGetMathMode: {handle: in_handle, mode: out_scalar}
+  cublasSetAtomicsMode: {_async: true, handle: in_handle, mode: in_scalar}
+  cublasGetAtomicsMode: {handle: in_handle, mode: out_scalar}
+
+  # --- level 1
+  cublasSaxpy_v2: {_async: true, handle: in_handle, n: in_scalar, alpha: in_scalar_ref, x: in_handle, incx: in_scalar, y: in_handle, incy: in_scalar}
+  cublasDaxpy_v2: {_async: true, handle: in_handle, n: in_scalar, alpha: in_scalar_ref, x: in_handle, incx: in_scalar, y: in_handle, incy: in_scalar}
+  cublasSscal_v2: {_async: true, handle: in_handle, n: in_scalar, alpha: in_scalar_ref, x: in_handle, incx: in_scalar}
+  cublasDscal_v2: {_async: true, handle: in_handle, n: in_scalar, alpha: in_scalar_ref, x: in_handle, incx: in_scalar}
+  cublasScopy_v2: {_async: true, handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, y: in_handle, incy: in_scalar}
+  cublasDcopy_v2: {_async: true, handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, y: in_handle, incy: in_scalar}
+  cublasSdot_v2: {handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, y: in_handle, incy: in_scalar, result: out_scalar_ref}
+  cublasDdot_v2: {handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, y: in_handle, incy: in_scalar, result: out_scalar_ref}
+  cublasSnrm2_v2: {handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, result: out_scalar_ref}
+  cublasDnrm2_v2: {handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, result: out_scalar_ref}
+  cublasSasum_v2: {handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, result: out_scalar_ref}
+  cublasDasum_v2: {handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, result: out_scalar_ref}
+  cublasIsamax_v2: {handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, result: out_scalar_ref}
+  cublasIdamax_v2: {handle: in_handle, n: in_scalar, x: in_handle, incx: in_scalar, result: out_scalar_ref}
+
+  # --- level 2
+  cublasSgemv_v2: {_async: true, handle: in_handle, trans: in_scalar, m: in_scalar, n: in_scalar, alpha: in_scalar_ref, A: in_handle, lda: in_scalar, x: in_handle, incx: in_scalar, beta: in_scalar_ref, y: in_handle, incy: in_scalar}
+  cublasDgemv_v2: {_async: true, handle: in_handle, trans: in_scalar, m: in_scalar, n: in_scalar, alpha: in_scalar_ref, A: in_handle, lda: in_scalar, x: in_handle, incx: in_scalar, beta: in_scalar_ref, y: in_handle, incy: in_scalar}
+
+  # --- level 3 / BLAS-like extensions
+  cublasSgemm_v2: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: in_scalar_ref, A: in_handle, lda: in_scalar, B: in_handle, ldb: in_scalar, beta: in_scalar_ref, C: in_handle, ldc: in_scalar}
+  cublasDgemm_v2: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: in_scalar_ref, A: in_handle, lda: in_scalar, B: in_handle, ldb: in_scalar, beta: in_scalar_ref, C: in_handle, ldc: in_scalar}
+  cublasGemmEx: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: "in_scalar_ref(tuna::cublas::ComputeScalarSize(computeType, Ctype))", A: in_handle, Atype: in_scalar, lda: in_scalar, B: in_handle, Btype: in_scalar, ldb: in_scalar, beta: "in_scalar_ref(tuna::cublas::ComputeScalarSize(computeType, Ctype))", C: in_handle, Ctype: in_scalar, ldc: in_scalar, computeType: in_scalar, algo: in_scalar}
+  cublasSgemmBatched: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: in_scalar_ref, Aarray: in_handle, lda: in_scalar, Barray: in_handle, ldb: in_scalar, beta: in_scalar_ref, Carray: in_handle, ldc: in_scalar, batchCount: in_scalar}
+  cublasDgemmBatched: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: in_scalar_ref, Aarray: in_handle, lda: in_scalar, Barray: in_handle, ldb: in_scalar, beta: in_scalar_ref, Carray: in_handle, ldc: in_scalar, batchCount: in_scalar}
+  cublasGemmBatchedEx: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: "in_scalar_ref(tuna::cublas::ComputeScalarSize(computeType, Ctype))", Aarray: in_handle, Atype: in_scalar, lda: in_scalar, Barray: in_handle, Btype: in_scalar, ldb: in_scalar, beta: "in_scalar_ref(tuna::cublas::ComputeScalarSize(computeType, Ctype))", Carray: in_handle, Ctype: in_scalar, ldc: in_scalar, batchCount: in_scalar, computeType: in_scalar, algo: in_scalar}
+  cublasSgemmStridedBatched: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: in_scalar_ref, A: in_handle, lda: in_scalar, strideA: in_scalar, B: in_handle, ldb: in_scalar, strideB: in_scalar, beta: in_scalar_ref, C: in_handle, ldc: in_scalar, strideC: in_scalar, batchCount: in_scalar}
+  cublasDgemmStridedBatched: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: in_scalar_ref, A: in_handle, lda: in_scalar, strideA: in_scalar, B: in_handle, ldb: in_scalar, strideB: in_scalar, beta: in_scalar_ref, C: in_handle, ldc: in_scalar, strideC: in_scalar, batchCount: in_scalar}
+  cublasGemmStridedBatchedEx: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, k: in_scalar, alpha: "in_scalar_ref(tuna::cublas::ComputeScalarSize(computeType, Ctype))", A: in_handle, Atype: in_scalar, lda: in_scalar, strideA: in_scalar, B: in_handle, Btype: in_scalar, ldb: in_scalar, strideB: in_scalar, beta: "in_scalar_ref(tuna::cublas::ComputeScalarSize(computeType, Ctype))", C: in_handle, Ctype: in_scalar, ldc: in_scalar, strideC: in_scalar, batchCount: in_scalar, computeType: in_scalar, algo: in_scalar}
+  cublasSgeam: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, alpha: in_scalar_ref, A: in_handle, lda: in_scalar, beta: in_scalar_ref, B: in_handle, ldb: in_scalar, C: in_handle, ldc: in_scalar}
+  cublasDgeam: {_async: true, handle: in_handle, transa: in_scalar, transb: in_scalar, m: in_scalar, n: in_scalar, alpha: in_scalar_ref, A: in_handle, lda: in_scalar, beta: in_scalar_ref, B: in_handle, ldb: in_scalar, C: in_handle, ldc: in_scalar}
+
+special:
+  # Host <-> device matrix copies: the client packs/unpacks the host side
+  # densely (any lda) and the payload rides the bulk channel.
+  cublasSetMatrix: host_copy
+  cublasGetMatrix: host_copy
+  cublasSetMatrixAsync: host_copy
+  cublasGetMatrixAsync: host_copy
+
+local:
+  # A strided vector is a 1 x n matrix with leading dimension = its stride, so
+  # the vector copies are the matrix copies above.
+  - cublasSetVector
+  - cublasGetVector
+  - cublasSetVectorAsync
+  - cublasGetVectorAsync
+  - cublasGetPointerMode_v2
+  - cublasGetStatusName
+  - cublasGetStatusString
+  - cublasGetCudartVersion
+  - cublasLoggerConfigure

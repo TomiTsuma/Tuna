@@ -45,7 +45,7 @@ int fail(const char* what, cudaError_t e) {
 
 int main() {
     std::string error;
-    auto backend = OpenRealCuda({}, {}, &error);
+    auto backend = OpenRealCuda({}, &error);
     if (!backend) {
         std::fprintf(stderr, "cannot open libcudart: %s\n", error.c_str());
         return 1;

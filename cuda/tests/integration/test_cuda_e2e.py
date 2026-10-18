@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU-free end-to-end test of Track B CUDA remoting (Phase 3b/3c).
+"""GPU-free end-to-end test of Track B CUDA remoting (Phase 3b-3d).
 
 The full production path, with only the GPU replaced:
 
@@ -12,11 +12,14 @@ Checks:
     streams/events, a 40 MiB bulk round trip, async error reporting;
   * mTLS: the same program with certificates from tuna_server's own tooling;
   * no TUNA_SERVER: the shim reports cudaErrorNoDevice instead of failing;
-  * a server whose runtime_library is the shim itself refuses to load it.
+  * a server whose runtime_library is the shim itself refuses to load it;
+  * with --cublas-client: a cuBLAS program (libcublas = Tuna's cuBLAS shim)
+    over plaintext and mTLS, and its no-server behavior.
 
-Usage: test_cuda_e2e.py TUNA_SERVER E2E_CLIENT MOCK_CUDA_LIB SHIM_DIR
+Usage: test_cuda_e2e.py TUNA_SERVER E2E_CLIENT MOCK_CUDA_LIB SHIM_DIR [--cublas-client CLIENT]
 """
 
+import argparse
 import json
 import os
 import re
@@ -78,17 +81,18 @@ def write_config(path, **fields):
     return path
 
 
-def test_plaintext(server_bin, client, mock, shim_dir, tmp):
+def test_plaintext(server_bin, clients, mock, shim_dir, tmp):
     server = Server(server_bin, write_config(tmp / "plain.json", cuda={"runtime_library": str(mock)}))
     try:
-        result = run_client(client, client_env(shim_dir, TUNA_SERVER=f"127.0.0.1:{server.port}"))
-        assert result.returncode == 0 and "PASS" in result.stdout, "plaintext e2e failed"
-        print("ok: unmodified-style CUDA program ran over plaintext loopback")
+        for client in clients:
+            result = run_client(client, client_env(shim_dir, TUNA_SERVER=f"127.0.0.1:{server.port}"))
+            assert result.returncode == 0 and "PASS" in result.stdout, f"plaintext e2e failed: {client}"
+            print(f"ok: {Path(client).name} ran over plaintext loopback")
     finally:
         assert server.stop() == 0
 
 
-def test_mtls(server_bin, client, mock, shim_dir, tmp):
+def test_mtls(server_bin, clients, mock, shim_dir, tmp):
     pki = tmp / "pki"
 
     def tool(*args):
@@ -106,13 +110,14 @@ def test_mtls(server_bin, client, mock, shim_dir, tmp):
         env = client_env(shim_dir, TUNA_SERVER=f"127.0.0.1:{server.port}", TUNA_SERVER_NAME="localhost",
                          TUNA_CA_CERT=pki / "ca/ca.crt", TUNA_CLIENT_CERT=pki / "alice/alice.crt",
                          TUNA_CLIENT_KEY=pki / "alice/alice.key", TUNA_LOG=1)
-        result = run_client(client, env)
-        assert result.returncode == 0 and "PASS" in result.stdout, "mTLS e2e failed"
-        assert "(mTLS)" in result.stderr, result.stderr
-        print("ok: the same program over mTLS")
+        for client in clients:
+            result = run_client(client, env)
+            assert result.returncode == 0 and "PASS" in result.stdout, f"mTLS e2e failed: {client}"
+            assert "(mTLS)" in result.stderr, result.stderr
+            print(f"ok: {Path(client).name} over mTLS")
 
         # Without a client certificate the shim cannot connect: no device.
-        result = run_client(client, client_env(shim_dir, TUNA_SERVER=f"127.0.0.1:{server.port}"),
+        result = run_client(clients[0], client_env(shim_dir, TUNA_SERVER=f"127.0.0.1:{server.port}"),
                             "--expect-no-server")
         assert result.returncode == 0, "a plaintext client got a device from an mTLS server"
         print("ok: a client without a certificate sees no device")
@@ -139,16 +144,29 @@ def test_shim_refused_as_runtime(server_bin, client, shim_dir, tmp):
         assert server.stop() == 0
 
 
+def test_cublas_no_server(cublas_client, shim_dir):
+    result = run_client(cublas_client, client_env(shim_dir), "--expect-no-server")
+    assert result.returncode == 0, "cuBLAS no-server behavior wrong"
+    print("ok: without TUNA_SERVER, cublasCreate reports CUBLAS_STATUS_NOT_INITIALIZED")
+
+
 def main():
-    if len(sys.argv) != 5:
-        raise SystemExit(__doc__)
-    server_bin, client, mock, shim_dir = sys.argv[1:]
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("server")
+    parser.add_argument("client")
+    parser.add_argument("mock")
+    parser.add_argument("shim_dir")
+    parser.add_argument("--cublas-client")
+    args = parser.parse_args()
+    clients = [args.client] + ([args.cublas_client] if args.cublas_client else [])
     with tempfile.TemporaryDirectory() as tmp_name:
         tmp = Path(tmp_name)
-        test_no_server(client, shim_dir)
-        test_plaintext(server_bin, client, mock, shim_dir, tmp)
-        test_mtls(server_bin, client, mock, shim_dir, tmp)
-        test_shim_refused_as_runtime(server_bin, client, shim_dir, tmp)
+        test_no_server(args.client, args.shim_dir)
+        test_plaintext(args.server, clients, args.mock, args.shim_dir, tmp)
+        test_mtls(args.server, clients, args.mock, args.shim_dir, tmp)
+        test_shim_refused_as_runtime(args.server, args.client, args.shim_dir, tmp)
+        if args.cublas_client:
+            test_cublas_no_server(args.cublas_client, args.shim_dir)
     print("all CUDA end-to-end checks passed")
 
 

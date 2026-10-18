@@ -52,7 +52,7 @@ tunnel::Dispatcher MakeDispatcher(std::shared_ptr<spdlog::logger> log, const Ser
             if (!state->tried) {
                 state->tried = true;
                 std::string error;
-                state->backend = cudart::OpenRealCuda(cuda.runtime_library, cuda.driver_library, &error);
+                state->backend = cudart::OpenRealCuda({cuda.runtime_library, cuda.driver_library, cuda.cublas_library}, &error);
                 if (state->backend) {
                     state->session = std::make_unique<cudart::CudaSession>(*state->backend);
                     log->info("CUDA backend opened ({})",

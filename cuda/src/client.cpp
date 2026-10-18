@@ -19,6 +19,7 @@
 #include <optional>
 #include <set>
 
+#include "tuna/cuda/bridge.h"
 #include "tuna/tunnel/client.h"
 
 namespace tuna::cudart {
@@ -219,3 +220,42 @@ uint64_t ContextGeneration() { return g_generation.load(); }
 void BumpContextGeneration() { ++g_generation; }
 
 }  // namespace tuna::cudart
+
+// ------------------------------------------------------ library bridge
+
+// Tuna's other library shims (libcublas, ...) send their calls through here,
+// so they share this process's session (see tuna/cuda/bridge.h). Unlike the
+// runtime's own calls, nothing here touches the CUDA last-error state: a
+// library reports failures in its own status codes.
+TUNA_CUDART_EXPORT int32_t tuna_cudart_call(uint32_t api_id, const char* args, size_t args_size, const char* bulk_in,
+                                            size_t bulk_in_size, uint32_t mode, TunaCallReply* reply) {
+    using namespace tuna::cudart;
+    thread_local Reply last;  // backs the pointers handed out in *reply
+    ArgWriter in;
+    if (args_size) in.put(args, args_size);
+    const std::string bulk = bulk_in_size ? std::string(bulk_in, bulk_in_size) : std::string();
+
+    if (mode == kTunaPost) {
+        // Post records a connection failure as the runtime's last error; keep
+        // the runtime's state as it was.
+        const int32_t before = LastError(/*clear=*/false);
+        const int32_t queued = Post(api_id, in, bulk);
+        if (queued != 0) {
+            LastError(/*clear=*/true);
+            Fail(before);
+        }
+        last = Reply{};
+        last.result = queued;
+    } else {
+        last = Call(api_id, in, bulk, /*synchronizing=*/mode == kTunaCallSynchronize);
+    }
+    if (reply) {
+        reply->result = last.result;
+        reply->transport_error = last.transport_error ? 1 : 0;
+        reply->out_args = last.out_args.data();
+        reply->out_args_size = last.out_args.size();
+        reply->bulk_out = last.bulk_out.data();
+        reply->bulk_out_size = last.bulk_out.size();
+    }
+    return last.result;
+}

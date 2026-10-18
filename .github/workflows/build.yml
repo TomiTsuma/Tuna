@@ -125,18 +125,36 @@ jobs:
             curl -sSfL "$CUDA_REDIST/$pkg" | tar -xJ --strip-components=1 -C "$HOME/cuda"
           done
 
+      # cuBLAS headers only (the archive also carries ~900 MB of libraries,
+      # which nothing here needs); cached, since they change only with the pin.
+      - name: Cache cuBLAS 12.8 headers
+        id: cublas-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/cublas
+          key: cublas-headers-linux-x86_64-12.8.4.1
+
+      - name: Fetch cuBLAS 12.8 headers (NVIDIA redistributable)
+        if: steps.cublas-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/cublas"
+          curl -sSfL "$CUDA_REDIST/libcublas/linux-x86_64/libcublas-linux-x86_64-12.8.4.1-archive.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$HOME/cublas" --wildcards '*/include/*'
+
       - name: Committed codegen output is current
         run: |
-          python3 tools/codegen/gen_cuda.py "$HOME/cuda/include" tools/codegen/annotations.yaml cuda/generated
+          python3 tools/codegen/gen_cuda.py "$HOME/cuda/include" tools/codegen/annotations.yaml cuda/generated \
+            --cublas "$HOME/cublas/include"
           git diff --exit-code -- cuda/generated tools/codegen/api_ids.yaml
 
-      - name: Configure server with the CUDA shim
+      - name: Configure server with the CUDA shim (+ cuBLAS)
         run: |
           cmake -S tuna-server -B build-cuda -DTUNA_SERVER_WORKLOAD_API=OFF -DTUNA_BUILD_CUDA_SHIM=ON \
-            -DTUNA_CUDA_INCLUDE_DIR="$HOME/cuda/include" -DCMAKE_BUILD_TYPE=Release
+            -DTUNA_CUDA_INCLUDE_DIR="$HOME/cuda/include" -DTUNA_CUBLAS_INCLUDE_DIR="$HOME/cublas/include" \
+            -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build-cuda --parallel
 
-      - name: Run tests (unit, marshalling, CUDA end-to-end over TCP and mTLS)
+      - name: Run tests (unit, marshalling, CUDA + cuBLAS end-to-end over TCP and mTLS)
         run: ctest --test-dir build-cuda --output-on-failure

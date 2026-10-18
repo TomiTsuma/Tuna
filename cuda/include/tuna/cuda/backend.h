@@ -14,9 +14,10 @@
 namespace tuna::cudart {
 
 // The real CUDA stack, as the server dispatcher sees it: runtime symbols
-// (cudaMalloc, ...) and the few driver symbols kernel launch needs
-// (cuModuleLoadData, cuLaunchKernel, ...). The production backend dlopen's
-// libcudart + libcuda; tests supply a mock whose Resolve() returns stand-ins.
+// (cudaMalloc, ...), the few driver symbols kernel launch needs
+// (cuModuleLoadData, cuLaunchKernel, ...) and cuBLAS (cublasSgemm_v2, ...).
+// The production backend dlopen's libcudart + libcuda (+ libcublas on first
+// use); tests supply a mock whose Resolve() returns stand-ins.
 class CudaBackend {
 public:
     virtual ~CudaBackend() = default;
@@ -57,6 +58,12 @@ private:
 
     bool DispatchSpecial(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out,
                          RpcResponse& resp);
+    // cuBLAS calls (dispatch_cublas.cpp; returns false when the build has no
+    // cuBLAS headers, and the call is then not supported).
+    bool DispatchCublas(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out,
+                        RpcResponse& resp);
+    void MatrixCopy(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out, RpcResponse& resp);
+    void CublasHandleCall(const RpcRequest& request, RpcResponse& resp);
     void Memcpy(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out, RpcResponse& resp);
     void Reset(RpcResponse& resp);
     void RegisterModule(const std::string& bulk_in, RpcResponse& resp);
@@ -79,6 +86,9 @@ private:
     std::map<std::pair<uint64_t, std::string>, uint64_t> function_ids_;  // (module, name) -> id
     std::map<std::pair<Context, uint64_t>, void*> loaded_;    // (ctx, module) -> CUmodule
     std::map<std::pair<Context, uint64_t>, void*> resolved_;  // (ctx, function) -> CUfunction
+    // cuBLAS handles this session created -> pointer mode is DEVICE. A handle
+    // is a host pointer in this process, so no other value reaches cuBLAS.
+    std::map<void*, bool> cublas_handles_;
 };
 
 // True if `api_id` is a CUDA call this build knows (not the echo id).

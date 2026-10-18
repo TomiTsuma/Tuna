@@ -10,11 +10,17 @@ twice:
 Each run must print PASS. Wall times are reported for both, which makes the
 per-call overhead of the remoting visible (on loopback, so no network cost).
 
+Samples that include cublas_v2.h also link NVIDIA's libcublas (--cublas-dir,
+e.g. the nvidia-cublas-cu12 wheel's lib/): natively they run on it, and
+through Tuna they load Tuna's libcublas.so.12 while the server runs NVIDIA's.
+Without --cublas-dir those samples are skipped.
+
 Needs an NVIDIA GPU and a CUDA 12 nvcc; it runs in the GPU lane / by hand,
 not in hosted CI.
 
 Usage: test_gpu_samples.py --server TUNA_SERVER --shim-dir DIR --nvcc NVCC
-                           --cudart-dir DIR [--arch sm_89] [--samples DIR] [--mtls]
+                           --cudart-dir DIR [--cublas-dir DIR] [--arch sm_89]
+                           [--samples DIR] [--mtls]
 """
 
 import argparse
@@ -69,6 +75,7 @@ def main():
     parser.add_argument("--shim-dir", required=True)
     parser.add_argument("--nvcc", required=True)
     parser.add_argument("--cudart-dir", required=True, help="directory with NVIDIA's libcudart.so.12")
+    parser.add_argument("--cublas-dir", help="directory with NVIDIA's libcublas.so.12 (headers in ../include)")
     parser.add_argument("--arch", default="sm_89")
     parser.add_argument("--samples", default=str(HERE.parent.parent / "samples"))
     parser.add_argument("--mtls", action="store_true", help="run the Tuna side over mTLS")
@@ -83,14 +90,23 @@ def main():
         binaries = {}
         for source in samples:
             binary = tmp / source.stem
+            extra = []
+            if "cublas_v2.h" in source.read_text():
+                if not args.cublas_dir:
+                    print(f"skip: {source.name} needs cuBLAS (--cublas-dir)")
+                    continue
+                cublas_dir = Path(args.cublas_dir)
+                extra = ["-I", str(cublas_dir.parent / "include"), "-Xlinker", str(cublas_dir / "libcublas.so.12")]
             compile_result = subprocess.run([args.nvcc, f"-arch={args.arch}", "-cudart", "shared", "-O2",
-                                             "-o", str(binary), str(source)], capture_output=True, text=True)
+                                             "-o", str(binary), str(source), *extra], capture_output=True, text=True)
             if compile_result.returncode != 0:
                 raise SystemExit(f"nvcc failed for {source.name}:\n{compile_result.stderr}")
             binaries[source.stem] = binary
 
         cudart = Path(args.cudart_dir) / "libcudart.so.12"
         config = {"listen_port": 0, "log_level": "info", "cuda": {"runtime_library": str(cudart)}}
+        if args.cublas_dir:
+            config["cuda"]["cublas_library"] = str(Path(args.cublas_dir) / "libcublas.so.12")
         tuna_env = dict(base_env)
         if args.mtls:
             pki = tmp / "pki"
@@ -111,7 +127,8 @@ def main():
             tuna_env["TUNA_SERVER"] = f"127.0.0.1:{server.port}"
             tuna_env["LD_LIBRARY_PATH"] = args.shim_dir + os.pathsep + base_env.get("LD_LIBRARY_PATH", "")
             native_env = dict(base_env)
-            native_env["LD_LIBRARY_PATH"] = args.cudart_dir + os.pathsep + base_env.get("LD_LIBRARY_PATH", "")
+            native_dirs = [args.cudart_dir] + ([args.cublas_dir] if args.cublas_dir else [])
+            native_env["LD_LIBRARY_PATH"] = os.pathsep.join(native_dirs + [base_env.get("LD_LIBRARY_PATH", "")])
 
             for name, binary in binaries.items():
                 native, native_s = run([str(binary)], native_env)

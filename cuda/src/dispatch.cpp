@@ -58,6 +58,7 @@ RpcResponse CudaSession::Dispatch(const RpcRequest& request, const std::string& 
     RpcResponse resp;
     try {
         if (DispatchSpecial(request, bulk_in, bulk_out, resp)) return resp;
+        if (DispatchCublas(request, bulk_in, bulk_out, resp)) return resp;
 #include "cuda_server_dispatch.inc"
     } catch (const std::exception&) {
         resp.set_result(kCudaErrorInvalidValue);  // short/garbled arg buffer
@@ -66,6 +67,13 @@ RpcResponse CudaSession::Dispatch(const RpcRequest& request, const std::string& 
     }
     return resp;
 }
+
+#ifndef TUNA_CUDA_HAVE_CUBLAS
+// Built without the cuBLAS headers: cuBLAS calls fall through to "not supported".
+bool CudaSession::DispatchCublas(const RpcRequest&, const std::string&, std::string*, RpcResponse&) { return false; }
+void CudaSession::MatrixCopy(const RpcRequest&, const std::string&, std::string*, RpcResponse&) {}
+void CudaSession::CublasHandleCall(const RpcRequest&, RpcResponse&) {}
+#endif
 
 bool CudaSession::DispatchSpecial(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out,
                                   RpcResponse& resp) {

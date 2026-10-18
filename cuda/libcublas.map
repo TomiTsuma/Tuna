@@ -1,0 +1,11 @@
+/* Linux version script for the replacement libcublas.so.12. The node name
+   matches NVIDIA's, so binaries linked against the real cuBLAS (whose imports
+   are versioned "libcublas.so.12") bind to the shim. Everything else stays
+   local. */
+libcublas.so.12 {
+  global:
+    cublas*;
+    tuna_cublas_shim;
+  local:
+    *;
+};

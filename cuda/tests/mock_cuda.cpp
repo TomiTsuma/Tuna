@@ -12,6 +12,13 @@
 // Kernels execute synchronously on the host with real grid/block bounds, so
 // launch-configuration bugs show up as wrong results.
 //
+// With cuBLAS headers (TUNA_CUDA_HAVE_CUBLAS) it also models a small cuBLAS:
+// handles with a stream and pointer mode, column-major S/D gemm (plain,
+// strided-batched, GemmEx for fp32), axpy, scal, dot, nrm2 and the
+// host<->device matrix copies, computed on the host from "device" memory.
+// Scalars are read from host or device memory according to the pointer mode,
+// so the remoting of both modes is checked by the results.
+//
 // It is linked into tuna_cuda_tests (in-process) and also built as a shared
 // library that tuna_server loads in place of libcudart: it exports only
 // tuna_cuda_resolve, which backend_real.cpp uses as its symbol source.
@@ -20,7 +27,12 @@
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#ifdef TUNA_CUDA_HAVE_CUBLAS
+#include <cublas_v2.h>
+#endif
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -43,6 +55,12 @@ struct Event {
     uint64_t sequence = 0;
 };
 
+struct BlasHandle {
+    uint64_t stream = 0;
+    bool device_scalars = false;  // CUBLAS_POINTER_MODE_DEVICE
+    int math_mode = 0;
+};
+
 struct MockDevice {
     std::map<uint64_t, std::vector<char>> buffers;  // device address -> bytes
     uint64_t next_address = 0x7f0000100000ull;
@@ -53,6 +71,7 @@ struct MockDevice {
     std::map<uint64_t, Module> modules;
     std::map<uint64_t, Function> functions;
     std::map<uint64_t, Event> events;
+    std::map<uint64_t, BlasHandle> blas_handles;
     uint64_t next_handle = 0x5000;
     uint64_t sequence = 0;
     MockCudaStats stats;
@@ -357,6 +376,266 @@ CUresult Occupancy(int* blocks, CUfunction function, int block_size, size_t, uns
     return CUDA_SUCCESS;
 }
 
+#ifdef TUNA_CUDA_HAVE_CUBLAS
+// ------------------------------------------------------------------- cuBLAS
+
+BlasHandle* Handle(cublasHandle_t handle) {
+    auto it = g.blas_handles.find(reinterpret_cast<uint64_t>(handle));
+    return it == g.blas_handles.end() ? nullptr : &it->second;
+}
+
+// A scalar argument, from host or device memory per the handle's pointer mode.
+template <typename T>
+bool ReadScalar(const BlasHandle& h, const T* p, T* value) {
+    if (!p) return false;
+    if (!h.device_scalars) {
+        *value = *p;
+        return true;
+    }
+    const T* d = Device<T>(reinterpret_cast<uint64_t>(p), 1);
+    if (!d) return false;
+    *value = *d;
+    return true;
+}
+
+template <typename T>
+bool WriteScalar(const BlasHandle& h, T* p, T value) {
+    if (!p) return false;
+    if (!h.device_scalars) {
+        *p = value;
+        return true;
+    }
+    T* d = Device<T>(reinterpret_cast<uint64_t>(p), 1);
+    if (!d) return false;
+    *d = value;
+    return true;
+}
+
+// A column-major rows x cols matrix with leading dimension ld in device memory.
+template <typename T>
+T* Matrix(const void* p, int rows, int cols, int ld) {
+    if (rows == 0 || cols == 0) return reinterpret_cast<T*>(const_cast<void*>(p));
+    return Device<T>(reinterpret_cast<uint64_t>(p), static_cast<size_t>(ld) * (cols - 1) + rows);
+}
+
+// A strided vector of n elements in device memory.
+template <typename T>
+T* Vector(const void* p, int n, int inc) {
+    if (n == 0) return reinterpret_cast<T*>(const_cast<void*>(p));
+    return Device<T>(reinterpret_cast<uint64_t>(p), static_cast<size_t>(inc) * (n - 1) + 1);
+}
+
+cublasStatus_t BlasCreate(cublasHandle_t* handle) {
+    const uint64_t h = g.next_handle++;
+    g.blas_handles[h] = BlasHandle{};
+    *handle = reinterpret_cast<cublasHandle_t>(h);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasDestroy(cublasHandle_t handle) {
+    return g.blas_handles.erase(reinterpret_cast<uint64_t>(handle)) ? CUBLAS_STATUS_SUCCESS
+                                                                    : CUBLAS_STATUS_NOT_INITIALIZED;
+}
+
+cublasStatus_t BlasGetVersion(cublasHandle_t handle, int* version) {
+    if (!Handle(handle)) return CUBLAS_STATUS_NOT_INITIALIZED;
+    *version = 120804;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasSetStream(cublasHandle_t handle, cudaStream_t stream) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    h->stream = reinterpret_cast<uint64_t>(stream);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasGetStream(cublasHandle_t handle, cudaStream_t* stream) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    *stream = reinterpret_cast<cudaStream_t>(h->stream);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasSetPointerMode(cublasHandle_t handle, cublasPointerMode_t mode) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    h->device_scalars = mode == CUBLAS_POINTER_MODE_DEVICE;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasSetMathMode(cublasHandle_t handle, cublasMath_t mode) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    h->math_mode = static_cast<int>(mode);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasGetMathMode(cublasHandle_t handle, cublasMath_t* mode) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    *mode = static_cast<cublasMath_t>(h->math_mode);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasSetWorkspace(cublasHandle_t handle, void* workspace, size_t size) {
+    if (!Handle(handle)) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (size && !Find(reinterpret_cast<uint64_t>(workspace), size)) return CUBLAS_STATUS_INVALID_VALUE;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+// C = alpha * op(A) * op(B) + beta * C, column-major (the reference BLAS).
+template <typename T>
+cublasStatus_t Gemm(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                    const T* alpha_p, const void* a_p, int lda, const void* b_p, int ldb, const T* beta_p, void* c_p,
+                    int ldc) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    const bool at = ta != CUBLAS_OP_N, bt = tb != CUBLAS_OP_N;
+    const int a_rows = at ? k : m, a_cols = at ? m : k;
+    const int b_rows = bt ? n : k, b_cols = bt ? k : n;
+    if (m < 0 || n < 0 || k < 0 || lda < std::max(1, a_rows) || ldb < std::max(1, b_rows) || ldc < std::max(1, m)) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    T alpha{}, beta{};
+    if (!ReadScalar(*h, alpha_p, &alpha) || !ReadScalar(*h, beta_p, &beta)) return CUBLAS_STATUS_INVALID_VALUE;
+    const T* A = Matrix<T>(a_p, a_rows, a_cols, lda);
+    const T* B = Matrix<T>(b_p, b_rows, b_cols, ldb);
+    T* C = Matrix<T>(c_p, m, n, ldc);
+    if (!A || !B || !C) return CUBLAS_STATUS_EXECUTION_FAILED;
+    ++g.stats.blas_calls;
+    for (int j = 0; j < n; ++j) {
+        for (int i = 0; i < m; ++i) {
+            T sum{};
+            for (int p = 0; p < k; ++p) {
+                const T a = at ? A[p + static_cast<size_t>(i) * lda] : A[i + static_cast<size_t>(p) * lda];
+                const T b = bt ? B[j + static_cast<size_t>(p) * ldb] : B[p + static_cast<size_t>(j) * ldb];
+                sum += a * b;
+            }
+            T& c = C[i + static_cast<size_t>(j) * ldc];
+            c = alpha * sum + (beta == T{} ? T{} : beta * c);
+        }
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+template <typename T>
+cublasStatus_t GemmStridedBatched(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb, int m, int n,
+                                  int k, const T* alpha, const T* a, int lda, long long stride_a, const T* b, int ldb,
+                                  long long stride_b, const T* beta, T* c, int ldc, long long stride_c, int batch) {
+    if (batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
+    for (int i = 0; i < batch; ++i) {
+        const cublasStatus_t status = Gemm<T>(handle, ta, tb, m, n, k, alpha, a + i * stride_a, lda, b + i * stride_b,
+                                              ldb, beta, c + i * stride_c, ldc);
+        if (status != CUBLAS_STATUS_SUCCESS) return status;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasGemmEx(cublasHandle_t handle, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                          const void* alpha, const void* a, cudaDataType a_type, int lda, const void* b,
+                          cudaDataType b_type, int ldb, const void* beta, void* c, cudaDataType c_type, int ldc,
+                          cublasComputeType_t compute, cublasGemmAlgo_t) {
+    // The mock only does fp32 (enough to check the compute-type scalar sizing).
+    if (a_type != CUDA_R_32F || b_type != CUDA_R_32F || c_type != CUDA_R_32F || compute != CUBLAS_COMPUTE_32F) {
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    return Gemm<float>(handle, ta, tb, m, n, k, static_cast<const float*>(alpha), a, lda, b, ldb,
+                       static_cast<const float*>(beta), c, ldc);
+}
+
+cublasStatus_t BlasSaxpy(cublasHandle_t handle, int n, const float* alpha_p, const float* x_p, int incx, float* y_p,
+                         int incy) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    float alpha = 0;
+    if (n < 0 || incx <= 0 || incy <= 0 || !ReadScalar(*h, alpha_p, &alpha)) return CUBLAS_STATUS_INVALID_VALUE;
+    const float* x = Vector<float>(x_p, n, incx);
+    float* y = Vector<float>(y_p, n, incy);
+    if (!x || !y) return CUBLAS_STATUS_EXECUTION_FAILED;
+    ++g.stats.blas_calls;
+    for (int i = 0; i < n; ++i) y[static_cast<size_t>(i) * incy] += alpha * x[static_cast<size_t>(i) * incx];
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasSscal(cublasHandle_t handle, int n, const float* alpha_p, float* x_p, int incx) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    float alpha = 0;
+    if (n < 0 || incx <= 0 || !ReadScalar(*h, alpha_p, &alpha)) return CUBLAS_STATUS_INVALID_VALUE;
+    float* x = Vector<float>(x_p, n, incx);
+    if (!x) return CUBLAS_STATUS_EXECUTION_FAILED;
+    ++g.stats.blas_calls;
+    for (int i = 0; i < n; ++i) x[static_cast<size_t>(i) * incx] *= alpha;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasSdot(cublasHandle_t handle, int n, const float* x_p, int incx, const float* y_p, int incy,
+                        float* result) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (n < 0 || incx <= 0 || incy <= 0) return CUBLAS_STATUS_INVALID_VALUE;
+    const float* x = Vector<float>(x_p, n, incx);
+    const float* y = Vector<float>(y_p, n, incy);
+    if (!x || !y) return CUBLAS_STATUS_EXECUTION_FAILED;
+    ++g.stats.blas_calls;
+    float sum = 0;
+    for (int i = 0; i < n; ++i) sum += x[static_cast<size_t>(i) * incx] * y[static_cast<size_t>(i) * incy];
+    return WriteScalar(*h, result, sum) ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+}
+
+cublasStatus_t BlasSnrm2(cublasHandle_t handle, int n, const float* x_p, int incx, float* result) {
+    BlasHandle* h = Handle(handle);
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (n < 0 || incx <= 0) return CUBLAS_STATUS_INVALID_VALUE;
+    const float* x = Vector<float>(x_p, n, incx);
+    if (!x) return CUBLAS_STATUS_EXECUTION_FAILED;
+    ++g.stats.blas_calls;
+    double sum = 0;
+    for (int i = 0; i < n; ++i) sum += double{x[static_cast<size_t>(i) * incx]} * x[static_cast<size_t>(i) * incx];
+    return WriteScalar(*h, result, static_cast<float>(std::sqrt(sum))) ? CUBLAS_STATUS_SUCCESS
+                                                                       : CUBLAS_STATUS_INVALID_VALUE;
+}
+
+// Host <-> device copies of a rows x cols block (any leading dimensions).
+cublasStatus_t BlasSetMatrix(int rows, int cols, int elem, const void* a, int lda, void* b, int ldb) {
+    if (rows < 0 || cols < 0 || elem <= 0 || lda < std::max(1, rows) || ldb < std::max(1, rows)) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    for (int j = 0; j < cols; ++j) {
+        char* dst = Find(reinterpret_cast<uint64_t>(b) + static_cast<uint64_t>(j) * ldb * elem,
+                         static_cast<size_t>(rows) * elem);
+        if (!dst) return CUBLAS_STATUS_MAPPING_ERROR;
+        std::memcpy(dst, static_cast<const char*>(a) + static_cast<size_t>(j) * lda * elem,
+                    static_cast<size_t>(rows) * elem);
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasGetMatrix(int rows, int cols, int elem, const void* a, int lda, void* b, int ldb) {
+    if (rows < 0 || cols < 0 || elem <= 0 || lda < std::max(1, rows) || ldb < std::max(1, rows)) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    for (int j = 0; j < cols; ++j) {
+        const char* src = Find(reinterpret_cast<uint64_t>(a) + static_cast<uint64_t>(j) * lda * elem,
+                               static_cast<size_t>(rows) * elem);
+        if (!src) return CUBLAS_STATUS_MAPPING_ERROR;
+        std::memcpy(static_cast<char*>(b) + static_cast<size_t>(j) * ldb * elem, src, static_cast<size_t>(rows) * elem);
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t BlasSetMatrixAsync(int rows, int cols, int elem, const void* a, int lda, void* b, int ldb,
+                                  cudaStream_t) {
+    return BlasSetMatrix(rows, cols, elem, a, lda, b, ldb);
+}
+
+cublasStatus_t BlasGetMatrixAsync(int rows, int cols, int elem, const void* a, int lda, void* b, int ldb,
+                                  cudaStream_t) {
+    return BlasGetMatrix(rows, cols, elem, a, lda, b, ldb);
+}
+#endif  // TUNA_CUDA_HAVE_CUBLAS
+
 struct Entry {
     const char* name;
     void* fn;
@@ -400,6 +679,30 @@ const Entry kEntries[] = {
     TUNA_MOCK("cuFuncGetAttribute", FuncGetAttribute),
     TUNA_MOCK("cuFuncSetAttribute", FuncSetAttribute),
     TUNA_MOCK("cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags", Occupancy),
+#ifdef TUNA_CUDA_HAVE_CUBLAS
+    TUNA_MOCK("cublasCreate_v2", BlasCreate),
+    TUNA_MOCK("cublasDestroy_v2", BlasDestroy),
+    TUNA_MOCK("cublasGetVersion_v2", BlasGetVersion),
+    TUNA_MOCK("cublasSetStream_v2", BlasSetStream),
+    TUNA_MOCK("cublasGetStream_v2", BlasGetStream),
+    TUNA_MOCK("cublasSetPointerMode_v2", BlasSetPointerMode),
+    TUNA_MOCK("cublasSetMathMode", BlasSetMathMode),
+    TUNA_MOCK("cublasGetMathMode", BlasGetMathMode),
+    TUNA_MOCK("cublasSetWorkspace_v2", BlasSetWorkspace),
+    TUNA_MOCK("cublasSgemm_v2", Gemm<float>),
+    TUNA_MOCK("cublasDgemm_v2", Gemm<double>),
+    TUNA_MOCK("cublasSgemmStridedBatched", GemmStridedBatched<float>),
+    TUNA_MOCK("cublasDgemmStridedBatched", GemmStridedBatched<double>),
+    TUNA_MOCK("cublasGemmEx", BlasGemmEx),
+    TUNA_MOCK("cublasSaxpy_v2", BlasSaxpy),
+    TUNA_MOCK("cublasSscal_v2", BlasSscal),
+    TUNA_MOCK("cublasSdot_v2", BlasSdot),
+    TUNA_MOCK("cublasSnrm2_v2", BlasSnrm2),
+    TUNA_MOCK("cublasSetMatrix", BlasSetMatrix),
+    TUNA_MOCK("cublasGetMatrix", BlasGetMatrix),
+    TUNA_MOCK("cublasSetMatrixAsync", BlasSetMatrixAsync),
+    TUNA_MOCK("cublasGetMatrixAsync", BlasGetMatrixAsync),
+#endif
 };
 #undef TUNA_MOCK
 

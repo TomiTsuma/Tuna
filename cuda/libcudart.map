@@ -8,6 +8,7 @@ libcudart.so.12 {
     cuda*;
     __cuda*;
     tuna_cudart_shim;
+    tuna_cudart_call;   /* bridge for Tuna's libcublas (tuna/cuda/bridge.h) */
   local:
     *;
 };
