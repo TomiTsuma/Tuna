@@ -12,6 +12,8 @@
 #                           are found: <build>/shim/libcublas.so.12 or
 #                           <build>/shim/cublas64_12.dll; it sends its calls
 #                           through tuna_cudart's session
+#   tuna_cuda_driver        the CUDA driver shim (Phase 3e): <build>/shim/libcuda.so.1
+#                           or <build>/shim/nvcuda.dll; also through tuna_cudart
 #   tuna_mock_cuda          a mock CUDA stack the server can load (tests)
 #   tuna_add_cuda_tests()   marshalling test + GPU-free end-to-end test
 #
@@ -75,7 +77,8 @@ endif()
 option(TUNA_REGEN_CUDA "Regenerate the CUDA stubs with libclang instead of using the committed ones" OFF)
 set(_tuna_cuda_gen_names
     cuda_api_ids.h cuda_client_stubs.inc cuda_server_dispatch.inc cuda_unsupported_stubs.inc
-    cuda_error_strings.inc cuda_coverage.inc)
+    cuda_error_strings.inc cuda_coverage.inc
+    driver_client_stubs.inc driver_server_dispatch.inc driver_unsupported_stubs.inc driver_error_strings.inc)
 set(_tuna_codegen_cublas_args)
 if(TUNA_CUDA_HAVE_CUBLAS)
     list(APPEND _tuna_cuda_gen_names cublas_client_stubs.inc cublas_server_dispatch.inc cublas_unsupported_stubs.inc)
@@ -93,7 +96,8 @@ if(TUNA_REGEN_CUDA)
                 ${_tuna_codegen_cublas_args}
         DEPENDS "${TUNA_CODEGEN_DIR}/gen_cuda.py" "${TUNA_CODEGEN_DIR}/annotations.yaml"
                 "${TUNA_CODEGEN_DIR}/cudart12_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_cublas.yaml"
-                "${TUNA_CODEGEN_DIR}/cublas12_exports.txt"
+                "${TUNA_CODEGEN_DIR}/cublas12_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_driver.yaml"
+                "${TUNA_CODEGEN_DIR}/cuda12_driver_exports.txt"
         COMMENT "Generating CUDA runtime remoting stubs"
         VERBATIM)
     add_custom_target(tuna_cuda_codegen DEPENDS ${TUNA_CUDA_GENERATED})
@@ -109,7 +113,7 @@ endif()
 set(_tuna_cuda_warnings $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 
 # Server-side dispatcher.
-add_library(tuna_cuda_dispatch STATIC ${TUNA_CUDA_DIR}/src/dispatch.cpp)
+add_library(tuna_cuda_dispatch STATIC ${TUNA_CUDA_DIR}/src/dispatch.cpp ${TUNA_CUDA_DIR}/src/dispatch_driver.cpp)
 if(TUNA_CUDA_HAVE_CUBLAS)
     target_sources(tuna_cuda_dispatch PRIVATE ${TUNA_CUDA_DIR}/src/dispatch_cublas.cpp)
     target_compile_definitions(tuna_cuda_dispatch PUBLIC TUNA_CUDA_HAVE_CUBLAS)
@@ -185,6 +189,32 @@ if(TUNA_CUDA_HAVE_CUBLAS)
     endif()
 endif()
 
+# The driver shim: libcuda.so.1 / nvcuda.dll next to the runtime shim, for
+# programs and libraries that call the driver API (PyTorch's primary-context
+# checks, cuGetProcAddress lookups). Like libcublas, it sends through
+# tuna_cudart's session.
+add_library(tuna_cuda_driver_client OBJECT
+    ${TUNA_CUDA_DIR}/src/driver_client.cpp
+    ${TUNA_CUDA_DIR}/src/driver_unsupported.cpp)
+add_dependencies(tuna_cuda_driver_client tuna_cuda_codegen)
+target_include_directories(tuna_cuda_driver_client PUBLIC ${_tuna_cuda_includes})
+target_compile_options(tuna_cuda_driver_client PRIVATE ${_tuna_cuda_warnings})
+
+add_library(tuna_cuda_driver SHARED $<TARGET_OBJECTS:tuna_cuda_driver_client>)
+target_link_libraries(tuna_cuda_driver PRIVATE tuna_cudart ${CMAKE_DL_LIBS})
+set_target_properties(tuna_cuda_driver PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shim"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shim")
+if(WIN32)
+    set_target_properties(tuna_cuda_driver PROPERTIES OUTPUT_NAME nvcuda PREFIX "")
+else()
+    # libcuda.so.1, like NVIDIA's (whose exports carry no symbol versions).
+    set_target_properties(tuna_cuda_driver PROPERTIES OUTPUT_NAME cuda VERSION 1 SOVERSION 1)
+    target_link_options(tuna_cuda_driver PRIVATE
+        "LINKER:--version-script=${TUNA_CUDA_DIR}/libcuda.map" "LINKER:--no-undefined")
+    set_property(TARGET tuna_cuda_driver APPEND PROPERTY LINK_DEPENDS "${TUNA_CUDA_DIR}/libcuda.map")
+endif()
+
 # A mock CUDA stack for tuna_server (runtime_library in its config), so the
 # end-to-end test runs on machines with no GPU.
 add_library(tuna_mock_cuda SHARED ${TUNA_CUDA_DIR}/tests/mock_cuda.cpp)
@@ -207,9 +237,13 @@ function(tuna_add_cuda_tests)
     if(TARGET tuna_cuda_tests)
         return()
     endif()
+    # The driver shim's objects ride along: its bridge calls are then the
+    # in-process runtime client, like the cuBLAS shim's below.
     add_executable(tuna_cuda_tests ${TUNA_CUDA_DIR}/tests/test_marshal.cpp ${TUNA_CUDA_DIR}/tests/mock_cuda.cpp
-                   $<TARGET_OBJECTS:tuna_cuda_client>)
-    target_link_libraries(tuna_cuda_tests PRIVATE Catch2::Catch2WithMain tuna_cuda_dispatch tuna_cuda_client)
+                   ${TUNA_CUDA_DIR}/tests/test_driver.cpp
+                   $<TARGET_OBJECTS:tuna_cuda_client> $<TARGET_OBJECTS:tuna_cuda_driver_client>)
+    target_link_libraries(tuna_cuda_tests PRIVATE Catch2::Catch2WithMain tuna_cuda_dispatch tuna_cuda_client
+                          ${CMAKE_DL_LIBS})
     if(TUNA_CUDA_HAVE_CUBLAS)
         # The cuBLAS shim's objects in the same process: tuna_cudart_call is
         # then the in-process runtime client, so the whole chain is exercised.
@@ -223,6 +257,21 @@ function(tuna_add_cuda_tests)
     add_executable(tuna_cuda_e2e_client ${TUNA_CUDA_DIR}/tests/e2e_client.cpp)
     target_include_directories(tuna_cuda_e2e_client PRIVATE ${TUNA_CUDA_INCLUDE_DIR})
     target_link_libraries(tuna_cuda_e2e_client PRIVATE tuna_cudart)
+
+    # A driver-API program linked against libcuda + libcudart.
+    add_executable(tuna_driver_e2e_client ${TUNA_CUDA_DIR}/tests/e2e_driver_client.cpp)
+    target_include_directories(tuna_driver_e2e_client PRIVATE ${TUNA_CUDA_INCLUDE_DIR})
+    target_link_libraries(tuna_driver_e2e_client PRIVATE tuna_cuda_driver tuna_cudart)
+    if(WIN32)
+        # Windows finds nvcuda.dll in System32 before anything on PATH, and a
+        # machine with an NVIDIA driver has the real one there. Only the
+        # application's own directory comes first, so the client gets one of
+        # its own with the shims next to it (as `tuna run` will arrange).
+        set_target_properties(tuna_driver_e2e_client PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/driver_e2e")
+        add_custom_command(TARGET tuna_driver_e2e_client POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different "$<TARGET_FILE:tuna_cuda_driver>"
+                    "$<TARGET_FILE:tuna_cudart>" "$<TARGET_FILE_DIR:tuna_driver_e2e_client>")
+    endif()
 
     # The same for cuBLAS: a program linked against libcublas + libcudart.
     set(_tuna_cublas_e2e_args)
@@ -238,7 +287,8 @@ function(tuna_add_cuda_tests)
         add_test(NAME tuna_cuda_e2e
             COMMAND "${Python3_EXECUTABLE}" "${TUNA_CUDA_DIR}/tests/integration/test_cuda_e2e.py"
                 "$<TARGET_FILE:tuna_server>" "$<TARGET_FILE:tuna_cuda_e2e_client>"
-                "$<TARGET_FILE:tuna_mock_cuda>" "$<TARGET_FILE_DIR:tuna_cudart>" ${_tuna_cublas_e2e_args})
+                "$<TARGET_FILE:tuna_mock_cuda>" "$<TARGET_FILE_DIR:tuna_cudart>" ${_tuna_cublas_e2e_args}
+                --driver-client "$<TARGET_FILE:tuna_driver_e2e_client>")
         set_tests_properties(tuna_cuda_e2e PROPERTIES TIMEOUT 120)
     endif()
 endfunction()

@@ -14,9 +14,12 @@ Checks:
   * no TUNA_SERVER: the shim reports cudaErrorNoDevice instead of failing;
   * a server whose runtime_library is the shim itself refuses to load it;
   * with --cublas-client: a cuBLAS program (libcublas = Tuna's cuBLAS shim)
-    over plaintext and mTLS, and its no-server behavior.
+    over plaintext and mTLS, and its no-server behavior;
+  * with --driver-client: a driver-API program (libcuda = Tuna's driver
+    shim) the same way.
 
 Usage: test_cuda_e2e.py TUNA_SERVER E2E_CLIENT MOCK_CUDA_LIB SHIM_DIR [--cublas-client CLIENT]
+                        [--driver-client CLIENT]
 """
 
 import argparse
@@ -150,6 +153,12 @@ def test_cublas_no_server(cublas_client, shim_dir):
     print("ok: without TUNA_SERVER, cublasCreate reports CUBLAS_STATUS_NOT_INITIALIZED")
 
 
+def test_driver_no_server(driver_client, shim_dir):
+    result = run_client(driver_client, client_env(shim_dir), "--expect-no-server")
+    assert result.returncode == 0, "driver no-server behavior wrong"
+    print("ok: without TUNA_SERVER, cuInit reports CUDA_ERROR_NO_DEVICE")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("server")
@@ -157,8 +166,9 @@ def main():
     parser.add_argument("mock")
     parser.add_argument("shim_dir")
     parser.add_argument("--cublas-client")
+    parser.add_argument("--driver-client")
     args = parser.parse_args()
-    clients = [args.client] + ([args.cublas_client] if args.cublas_client else [])
+    clients = [args.client] + [c for c in (args.cublas_client, args.driver_client) if c]
     with tempfile.TemporaryDirectory() as tmp_name:
         tmp = Path(tmp_name)
         test_no_server(args.client, args.shim_dir)
@@ -167,6 +177,8 @@ def main():
         test_shim_refused_as_runtime(args.server, args.client, args.shim_dir, tmp)
         if args.cublas_client:
             test_cublas_no_server(args.cublas_client, args.shim_dir)
+        if args.driver_client:
+            test_driver_no_server(args.driver_client, args.shim_dir)
     print("all CUDA end-to-end checks passed")
 
 

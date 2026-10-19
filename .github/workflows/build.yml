@@ -146,6 +146,8 @@ jobs:
           python3 tools/codegen/gen_cuda.py "$HOME/cuda/include" tools/codegen/annotations.yaml cuda/generated \
             --cublas "$HOME/cublas/include"
           git diff --exit-code -- cuda/generated tools/codegen/api_ids.yaml
+          # A newly generated file that was never committed is stale too.
+          test -z "$(git status --porcelain -- cuda/generated tools/codegen/api_ids.yaml)"
 
       - name: Configure server with the CUDA shim (+ cuBLAS)
         run: |
@@ -156,5 +158,5 @@ jobs:
       - name: Build
         run: cmake --build build-cuda --parallel
 
-      - name: Run tests (unit, marshalling, CUDA + cuBLAS end-to-end over TCP and mTLS)
+      - name: Run tests (unit, marshalling, CUDA + cuBLAS + driver end-to-end over TCP and mTLS)
         run: ctest --test-dir build-cuda --output-on-failure

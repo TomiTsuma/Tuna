@@ -39,4 +39,10 @@ struct TunaCallReply {
 int32_t tuna_cudart_call(uint32_t api_id, const char* args, size_t args_size, const char* bulk_in,
                          size_t bulk_in_size, uint32_t mode, TunaCallReply* reply);
 
+// Changes whenever server-side context state the runtime shim knows of is
+// invalidated (cudaDeviceReset, switching devices). Library shims that cache
+// per-context state (the driver shim's "primary context is active") drop it
+// when this changes.
+uint64_t tuna_cudart_context_generation(void);
+
 }  // extern "C"

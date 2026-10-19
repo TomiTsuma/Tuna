@@ -62,6 +62,8 @@ functions:
   cudaStreamWaitEvent: {_async: true, stream: in_handle, event: in_handle, flags: in_scalar}
   cudaStreamGetPriority: {hStream: in_handle, priority: out_scalar}
   cudaStreamGetFlags: {hStream: in_handle, flags: out_scalar}
+  # Graph capture is not supported, so the server always answers "not capturing".
+  cudaStreamIsCapturing: {stream: in_handle, pCaptureStatus: out_scalar}
 
   # --- events
   cudaEventCreate: {event: out_handle}

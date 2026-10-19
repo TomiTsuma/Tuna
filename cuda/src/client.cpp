@@ -259,3 +259,5 @@ TUNA_CUDART_EXPORT int32_t tuna_cudart_call(uint32_t api_id, const char* args, s
     }
     return last.result;
 }
+
+TUNA_CUDART_EXPORT uint64_t tuna_cudart_context_generation(void) { return tuna::cudart::ContextGeneration(); }

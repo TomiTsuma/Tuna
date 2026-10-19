@@ -466,6 +466,21 @@ TUNA_CUDART_EXPORT cudaError_t cudaStreamGetPriority(cudaStream_t hStream, int *
     return static_cast<cudaError_t>(tuna::cudart::Finish(reply));
 }
 
+TUNA_CUDART_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus * pCaptureStatus) {
+    tuna::cudart::ArgWriter in;
+    in.put_u64(reinterpret_cast<uint64_t>(stream));
+    tuna::cudart::Reply reply = tuna::cudart::Call(kApi_cudaStreamIsCapturing, in, {}, false);
+    if (!reply.transport_error && reply.result == 0) {
+        try {
+            tuna::cudart::ArgReader out(reply.out_args);
+            if (pCaptureStatus) out.get(pCaptureStatus, 4); else out.skip(4);
+        } catch (const std::exception&) {
+            return static_cast<cudaError_t>(tuna::cudart::Fail(cudaErrorUnknown));  // malformed reply
+        }
+    }
+    return static_cast<cudaError_t>(tuna::cudart::Finish(reply));
+}
+
 TUNA_CUDART_EXPORT cudaError_t cudaStreamQuery(cudaStream_t stream) {
     tuna::cudart::ArgWriter in;
     in.put_u64(reinterpret_cast<uint64_t>(stream));

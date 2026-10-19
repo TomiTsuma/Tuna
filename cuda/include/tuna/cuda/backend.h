@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -64,6 +65,10 @@ private:
                         RpcResponse& resp);
     void MatrixCopy(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out, RpcResponse& resp);
     void CublasHandleCall(const RpcRequest& request, RpcResponse& resp);
+    // Driver API calls (dispatch_driver.cpp).
+    bool DispatchDriver(const RpcRequest& request, RpcResponse& resp);
+    // cuInit(0) in this worker, once; 0 or the CUresult that failed.
+    int32_t DriverInit();
     void Memcpy(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out, RpcResponse& resp);
     void Reset(RpcResponse& resp);
     void RegisterModule(const std::string& bulk_in, RpcResponse& resp);
@@ -89,6 +94,10 @@ private:
     // cuBLAS handles this session created -> pointer mode is DEVICE. A handle
     // is a host pointer in this process, so no other value reaches cuBLAS.
     std::map<void*, bool> cublas_handles_;
+    // Driver API state: whether cuInit succeeded, and the devices whose primary
+    // context this session retained (kept until the worker exits).
+    bool driver_initialized_ = false;
+    std::set<int> retained_primary_;
 };
 
 // True if `api_id` is a CUDA call this build knows (not the echo id).

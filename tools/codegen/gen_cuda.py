@@ -20,6 +20,15 @@ annotations.yaml) and emits the replacement libcublas's pieces:
   cublas_unsupported_stubs.inc  every other libcublas export, returning
                                 CUBLAS_STATUS_NOT_SUPPORTED
 
+Always, it also parses cuda.h with annotations_driver.yaml and emits the
+replacement libcuda's (driver API's) pieces:
+
+  driver_client_stubs.inc       client: one exported function per annotated API
+  driver_server_dispatch.inc    server: decode -> real driver call -> encode
+  driver_unsupported_stubs.inc  every other libcuda export (cuda12_driver_exports.txt),
+                                returning CUDA_ERROR_NOT_SUPPORTED
+  driver_error_strings.inc      cuGetErrorName/String tables (from cuda.h)
+
 The flat little-endian arg encoding is the one in the wire plan (§4): too hot
 for protobuf-per-call. Handles (device pointers, streams, events) cross as
 uint64; the server owns the real values and the client never dereferences them.
@@ -29,8 +38,9 @@ so a newer client and an older server still agree on every call they share.
 New names get the next free id and the registry is rewritten.
 
 Usage: gen_cuda.py CUDA_INCLUDE_DIR annotations.yaml OUT_DIR [--cublas CUBLAS_INCLUDE_DIR]
-       (api_ids.yaml, cudart12_exports.txt, annotations_cublas.yaml and
-       cublas12_exports.txt are read next to annotations.yaml)
+       (api_ids.yaml, cudart12_exports.txt, annotations_cublas.yaml,
+       cublas12_exports.txt, annotations_driver.yaml and
+       cuda12_driver_exports.txt are read next to annotations.yaml)
 """
 
 import re
@@ -96,11 +106,12 @@ def collect_functions(tu, prefix):
     return functions
 
 
-def collect_errors(tu):
-    """(value, name, description) for every cudaError enumerator."""
+def collect_errors(tu, enum_name="cudaError"):
+    """(value, name, description) for every enumerator of the runtime's cudaError
+    (or, with enum_name="cudaError_enum", the driver's CUresult)."""
     errors = {}
     for c in tu.cursor.walk_preorder():
-        if c.kind == ci.CursorKind.ENUM_DECL and c.spelling == "cudaError":
+        if c.kind == ci.CursorKind.ENUM_DECL and c.spelling == enum_name:
             for e in c.get_children():
                 if e.kind != ci.CursorKind.ENUM_CONSTANT_DECL or e.enum_value in errors:
                     continue
@@ -111,7 +122,7 @@ def collect_errors(tu):
                 text = re.sub(r"\s+", " ", text).strip()
                 errors[e.enum_value] = (e.spelling, text)
     if not errors:
-        raise SystemExit("cudaError enum not found")
+        raise SystemExit(f"{enum_name} enum not found")
     return sorted((v, n, d) for v, (n, d) in errors.items())
 
 
@@ -191,11 +202,37 @@ def real_signature(func):
     return f"{func['result']} (*)({args})"
 
 
-def emit_client_stub(name, api, func, fields, flags):
+# How the runtime and driver client stubs differ: the export macro, the status
+# type and where calls go. The runtime records failures as the thread's last
+# error (cudaGetLastError); the driver API has no last error, and its calls go
+# through the runtime shim's session (tuna_cudart_call), like cuBLAS's.
+RUNTIME_CLIENT = {
+    "export": "TUNA_CUDART_EXPORT {result}",
+    "status": "cudaError_t",
+    "invalid": "static_cast<cudaError_t>(tuna::cudart::Fail(cudaErrorInvalidValue))",
+    "malformed": "static_cast<cudaError_t>(tuna::cudart::Fail(cudaErrorUnknown))",
+    "post": "tuna::cudart::Post",
+    "call": "tuna::cudart::Call({api}, in, {{}}, {sync})",
+    "finish": "tuna::cudart::Finish",
+}
+DRIVER_CLIENT = {
+    "export": "TUNA_CUDA_DRIVER_EXPORT {result} CUDAAPI",
+    "status": "CUresult",
+    "invalid": "CUDA_ERROR_INVALID_VALUE",
+    "malformed": "CUDA_ERROR_UNKNOWN",
+    "post": "tuna::cudrv::Post",
+    "call": "tuna::cudrv::Call({api}, in, {sync})",
+    "finish": "tuna::cudrv::Finish",
+}
+
+
+def emit_client_stub(name, api, func, fields, flags, lib=RUNTIME_CLIENT):
     params = ", ".join(f"{ctype} {aname}" for ctype, aname, _ in func["args"]) or "void"
+    status = lib["status"]
     # _wrap: the client exports a hand-written function of this name (caching,
     # allocation tracking) that calls this generated one.
-    head = f"static {func['result']} tuna_remote_{name}" if flags.get("_wrap") else         f"TUNA_CUDART_EXPORT {func['result']} {name}"
+    head = f"static {func['result']} tuna_remote_{name}" if flags.get("_wrap") else \
+        f"{lib['export'].format(result=func['result'])} {name}"
     lines = [f"{head}({params}) {{",
              "    tuna::cudart::ArgWriter in;"]
     for f in fields:
@@ -204,14 +241,14 @@ def emit_client_stub(name, api, func, fields, flags):
         elif f.role == "in_scalar":
             lines.append(f"    in.put(&{f.name}, {f.width});")
         elif f.role == "in_struct":
-            lines.append(f"    if (!{f.name}) return static_cast<cudaError_t>(tuna::cudart::Fail(cudaErrorInvalidValue));")
+            lines.append(f"    if (!{f.name}) return {lib['invalid']};")
             lines.append(f"    in.put({f.name}, {f.width});")
     if flags.get("_async"):
-        lines.append(f"    return static_cast<cudaError_t>(tuna::cudart::Post({api}, in));")
+        lines.append(f"    return static_cast<{status}>({lib['post']}({api}, in));")
         lines.append("}")
         return "\n".join(lines)
     sync = "true" if flags.get("_sync") else "false"
-    lines.append(f"    tuna::cudart::Reply reply = tuna::cudart::Call({api}, in, {{}}, {sync});")
+    lines.append(f"    tuna::cudart::Reply reply = {lib['call'].format(api=api, sync=sync)};")
     outs = [f for f in fields if f.role.startswith("out")]
     if outs:
         lines.append("    if (!reply.transport_error && reply.result == 0) {")
@@ -224,16 +261,17 @@ def emit_client_stub(name, api, func, fields, flags):
             else:
                 lines.append(f"            if ({f.name}) out.get({f.name}, {f.width}); else out.skip({f.width});")
         lines.append("        } catch (const std::exception&) {")
-        lines.append("            return static_cast<cudaError_t>(tuna::cudart::Fail(cudaErrorUnknown));  // malformed reply")
+        lines.append(f"            return {lib['malformed']};  // malformed reply")
         lines.append("        }")
         lines.append("    }")
-    lines.append("    return static_cast<cudaError_t>(tuna::cudart::Finish(reply));")
+    lines.append(f"    return static_cast<{status}>({lib['finish']}(reply));")
     lines.append("}")
     return "\n".join(lines)
 
 
-def emit_dispatch_case(name, api, func, fields):
+def emit_dispatch_case(name, api, func, fields, prologue=()):
     lines = [f"    case {api}: {{  // {name}",
+             *prologue,
              "        tuna::cudart::ArgReader in(request.args());"]
     call_args = []
     outs = []
@@ -438,6 +476,76 @@ def generate_cublas(cublas_include, cuda_include, codegen_dir, out_dir):
     return sorted(set(simple) | set(special)), emit
 
 
+# --------------------------------------------------------------- driver API
+#
+# The replacement libcuda.so.1 / nvcuda.dll (Phase 3e). Applications rarely
+# call the driver API themselves, but frameworks do (PyTorch checks the primary
+# context per op), and NVIDIA's own libraries reach the driver through it. Its
+# calls go through the runtime shim's session like cuBLAS's.
+
+# Driver handles that may cross the wire: their values are addresses the GPU
+# (not the worker's CPU) dereferences, or a stream the server issued. Contexts,
+# modules and functions are host pointers in the worker, so the generated
+# driver calls never take them; the shim keeps its own tokens for those.
+DRIVER_WIRE_HANDLES = ("CUdeviceptr", "CUstream")
+
+
+def generate_driver(cuda_include, codegen_dir, out_dir):
+    """Emits the libcuda pieces; returns (remoted names, emit(registry) -> summary)."""
+    tu = parse_tu(cuda_include / "cuda.h", [cuda_include])
+    functions = collect_functions(tu, "cu")
+    simple, special, local = load_annotations(codegen_dir / "annotations_driver.yaml")
+    missing = [n for n in list(simple) + list(special) + sorted(local) if n not in functions]
+    if missing:
+        raise SystemExit(f"driver functions not found in cuda.h: {missing}")
+    for name, annotation in simple.items():
+        for pname, role in annotation.items():
+            if role != "in_handle":
+                continue
+            ctype = next(c for c, a, _ in functions[name]["args"] if a == pname)
+            if ctype not in DRIVER_WIRE_HANDLES:
+                raise SystemExit(f"{name}: '{ctype} {pname}' is a host pointer on the server; "
+                                 "driver calls may only pass " + ", ".join(DRIVER_WIRE_HANDLES))
+
+    def emit(registry):
+        del registry  # ids come from cuda_api_ids.h
+        client = ["// Generated by gen_cuda.py. Do not edit."]
+        dispatch = ["// Generated by gen_cuda.py. Do not edit.", "    switch (request.api_id()) {"]
+        # The driver must be initialized in the worker before any driver call
+        # (the runtime does it lazily, and may not have run yet).
+        prologue = ["        if (int32_t e = DriverInit()) { resp.set_result(e); break; }"]
+        for name in sorted(simple):
+            fields = classify(name, functions[name], simple[name])
+            client.append(emit_client_stub(name, f"kApi_{name}", functions[name], fields, simple[name],
+                                           DRIVER_CLIENT))
+            dispatch.append(emit_dispatch_case(name, f"kApi_{name}", functions[name], fields, prologue))
+        dispatch += ["    default: return false;", "    }", "    return true;"]
+        (out_dir / "driver_client_stubs.inc").write_text("\n\n".join(client) + "\n")
+        (out_dir / "driver_server_dispatch.inc").write_text("\n".join(dispatch) + "\n")
+
+        exports = (codegen_dir / "cuda12_driver_exports.txt").read_text().split()
+        implemented = set(simple) | set(special) | local
+        unsupported = [n for n in exports if n not in implemented]
+        stubs = ["// Generated by gen_cuda.py. Do not edit."]
+        for name in unsupported:
+            stubs.append(f'TUNA_CUDA_DRIVER_EXPORT int {name}() {{ return tuna::cudrv::Unsupported("{name}"); }}')
+        (out_dir / "driver_unsupported_stubs.inc").write_text("\n".join(stubs) + "\n")
+
+        errors = collect_errors(tu, "cudaError_enum")
+        err = ["// Generated by gen_cuda.py. Do not edit.",
+               "struct CuErrorText { int value; const char* name; const char* text; };",
+               "static const CuErrorText kCuErrorTexts[] = {"]
+        for value, ename, text in errors:
+            err.append(f"    {{{value}, {c_string(ename)}, {c_string(text)}}},")
+        err.append("};")
+        (out_dir / "driver_error_strings.inc").write_text("\n".join(err) + "\n")
+        return (f"driver: {len(simple) + len(special)} remoted ({len(simple)} simple, {len(special)} special), "
+                f"{len(local)} client-local, {len(unsupported)} unsupported stubs, {len(errors)} error codes; "
+                f"{len(functions)} functions in cuda.h")
+
+    return sorted(set(simple) | set(special)), emit
+
+
 def load_registry(path):
     if not path.exists():
         return {}
@@ -488,19 +596,23 @@ def main():
     cublas_remoted, emit_cublas = [], None
     if cublas_include:
         cublas_remoted, emit_cublas = generate_cublas(cublas_include, include_dir, codegen_dir, out_dir)
+    # The driver header ships with every toolkit (and the cuda_cudart
+    # redistributable), so the driver shim is always generated.
+    driver_remoted, emit_driver = generate_driver(include_dir, codegen_dir, out_dir)
 
-    # The runtime's names first, then cuBLAS's: one id space, so the server
-    # routes every Tuna call by id alone.
+    # The runtime's names first, then cuBLAS's, then the driver's: one id
+    # space, so the server routes every Tuna call by id alone.
     registry_path = codegen_dir / "api_ids.yaml"
     registry = load_registry(registry_path)
     remoted = sorted(set(simple) | set(special))
     next_id = max(registry.values(), default=0) + 1
-    for name in remoted + cublas_remoted:
+    for name in remoted + cublas_remoted + driver_remoted:
         if name not in registry:
             registry[name] = next_id
             next_id += 1
     save_registry(registry_path, registry)
     cublas_summary = emit_cublas(registry) if emit_cublas else None
+    driver_summary = emit_driver(registry)
 
     ids_h = ["// Generated by gen_cuda.py. Do not edit.", "#pragma once", "#include <cstdint>",
              "namespace tuna::cudart {", "enum TunaCudaApi : uint32_t {"]
@@ -555,6 +667,7 @@ def main():
           f"{len(functions)} runtime functions in the header")
     if cublas_summary:
         print(cublas_summary)
+    print(driver_summary)
 
 
 if __name__ == "__main__":

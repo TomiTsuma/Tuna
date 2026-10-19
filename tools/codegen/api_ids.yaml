@@ -98,3 +98,15 @@ cublasSgemm_v2: 93
 cublasSgemv_v2: 94
 cublasSnrm2_v2: 95
 cublasSscal_v2: 96
+cudaStreamIsCapturing: 97
+cuDeviceGet: 98
+cuDeviceGetAttribute: 99
+cuDeviceGetCount: 100
+cuDeviceGetName: 101
+cuDeviceGetUuid_v2: 102
+cuDevicePrimaryCtxGetState: 103
+cuDevicePrimaryCtxRetain: 104
+cuDevicePrimaryCtxSetFlags_v2: 105
+cuDeviceTotalMem_v2: 106
+cuDriverGetVersion: 107
+cuInit: 108

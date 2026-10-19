@@ -59,6 +59,7 @@ RpcResponse CudaSession::Dispatch(const RpcRequest& request, const std::string& 
     try {
         if (DispatchSpecial(request, bulk_in, bulk_out, resp)) return resp;
         if (DispatchCublas(request, bulk_in, bulk_out, resp)) return resp;
+        if (DispatchDriver(request, resp)) return resp;
 #include "cuda_server_dispatch.inc"
     } catch (const std::exception&) {
         resp.set_result(kCudaErrorInvalidValue);  // short/garbled arg buffer

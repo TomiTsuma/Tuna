@@ -1,0 +1,62 @@
+# Pointer semantics for CUDA driver API (cuda.h) functions remoted by Tuna's
+# replacement libcuda.so.1 / nvcuda.dll (Phase 3e). Same roles and flags as
+# annotations.yaml.
+#
+# Why a driver shim at all: Tuna remotes CUDA at the runtime API (libcudart),
+# but programs and libraries also call the driver directly. PyTorch checks
+# the primary context before every op (cuDevicePrimaryCtxGetState, through
+# libcaffe2_nvrtc.so), and NVIDIA's libraries find the driver through
+# cuGetProcAddress. On a client with no GPU those calls must reach the server
+# too, and in the same session as the runtime calls: the shim sends through
+# the runtime shim's bridge (tuna_cudart_call), like Tuna's libcublas.
+#
+# Handles: CUcontext, CUmodule and CUfunction are host pointers inside the
+# server's worker, so no generated call takes them (gen_cuda.py refuses any
+# in_handle other than CUdeviceptr / CUstream). Contexts are client-side
+# tokens: Tuna supports the primary context only, which the server's runtime
+# owns (see cuda/src/driver_client.cpp). A CUdevice is a device ordinal.
+#
+# special: hand-written (cuda/src/driver_client.cpp, cuda/src/dispatch_driver.cpp)
+# local:   implemented in the client shim only
+# Every other libcuda export (cuda12_driver_exports.txt) is generated as a stub
+# returning CUDA_ERROR_NOT_SUPPORTED (801), logged once with TUNA_LOG=1.
+
+functions:
+  # --- initialization and versions
+  cuInit: {Flags: in_scalar}
+  cuDriverGetVersion: {driverVersion: out_scalar}
+
+  # --- devices
+  cuDeviceGet: {device: out_scalar, ordinal: in_scalar}
+  cuDeviceGetCount: {count: out_scalar}
+  # Never changes for a device; frameworks ask often, so the shim caches it.
+  cuDeviceGetAttribute: {_wrap: true, pi: out_scalar, attrib: in_scalar, dev: in_scalar}
+  cuDeviceTotalMem_v2: {bytes: out_scalar, dev: in_scalar}
+  cuDeviceGetUuid_v2: {uuid: out_struct, dev: in_scalar}
+
+  # --- primary context state (PyTorch asks before every op: cached once active)
+  cuDevicePrimaryCtxGetState: {_wrap: true, dev: in_scalar, flags: out_scalar, active: out_scalar}
+  cuDevicePrimaryCtxSetFlags_v2: {dev: in_scalar, flags: in_scalar}
+
+special:
+  # Makes the device's primary context exist on the server (retained once per
+  # session); the client returns its own token for it.
+  cuDevicePrimaryCtxRetain: primary_ctx
+  # name is an OUT buffer of `len` bytes.
+  cuDeviceGetName: device_name
+
+local:
+  # Contexts: per-thread tokens over the server's primary contexts.
+  - cuDevicePrimaryCtxRelease_v2
+  - cuCtxGetCurrent
+  - cuCtxSetCurrent
+  - cuCtxPushCurrent_v2
+  - cuCtxPopCurrent_v2
+  - cuCtxGetDevice
+  # The primary context is the runtime's: synchronizing it is cudaDeviceSynchronize.
+  - cuCtxSynchronize
+  - cuGetErrorName
+  - cuGetErrorString
+  # Returns the shim's own exports, so a library that looks the driver up
+  # through it (cudart, cuBLASLt, cuDNN) never bypasses Tuna.
+  - cuGetProcAddress_v2

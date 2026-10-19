@@ -23,6 +23,7 @@ struct MockCudaStats {
     uint64_t property_queries = 0;
     uint64_t attribute_queries = 0;
     uint64_t blas_calls = 0;  // cuBLAS compute calls executed (gemm, axpy, dot, ...)
+    uint64_t driver_queries = 0;  // driver device / primary-context queries answered
 };
 
 // In-process use (tuna_cuda_tests): a fresh device, and counters.

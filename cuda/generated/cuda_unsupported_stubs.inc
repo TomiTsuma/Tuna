@@ -330,7 +330,6 @@ TUNA_CUDART_EXPORT int cudaStreamGetFlags_ptsz() { return tuna::cudart::Unsuppor
 TUNA_CUDART_EXPORT int cudaStreamGetId() { return tuna::cudart::Unsupported("cudaStreamGetId"); }
 TUNA_CUDART_EXPORT int cudaStreamGetId_ptsz() { return tuna::cudart::Unsupported("cudaStreamGetId_ptsz"); }
 TUNA_CUDART_EXPORT int cudaStreamGetPriority_ptsz() { return tuna::cudart::Unsupported("cudaStreamGetPriority_ptsz"); }
-TUNA_CUDART_EXPORT int cudaStreamIsCapturing() { return tuna::cudart::Unsupported("cudaStreamIsCapturing"); }
 TUNA_CUDART_EXPORT int cudaStreamIsCapturing_ptsz() { return tuna::cudart::Unsupported("cudaStreamIsCapturing_ptsz"); }
 TUNA_CUDART_EXPORT int cudaStreamQuery_ptsz() { return tuna::cudart::Unsupported("cudaStreamQuery_ptsz"); }
 TUNA_CUDART_EXPORT int cudaStreamSetAttribute() { return tuna::cudart::Unsupported("cudaStreamSetAttribute"); }

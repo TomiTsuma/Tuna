@@ -129,6 +129,11 @@ std::unique_ptr<CudaBackend> OpenRealCuda(const CudaLibraries& libraries, std::s
             if (error) *error = driver_path + ": " + LastError();
             return nullptr;
         }
+        if (Symbol(driver, "tuna_cuda_driver_shim")) {
+            if (error) *error = driver_path + " is Tuna's client shim, not NVIDIA's driver; fix the server's library path";
+            CloseLibrary(driver);
+            return nullptr;
+        }
     }
     return std::make_unique<RealCudaBackend>(runtime, driver,
                                              libraries.cublas.empty() ? kDefaultCublas : libraries.cublas);

@@ -19,7 +19,10 @@ This is option **B2** (Linux client first) from
 ```
 
 Since Phase 3d the shim set also replaces **cuBLAS** (`libcublas.so.12` /
-`cublas64_12.dll`): see [cuBLAS](#cublas-phase-3d) below.
+`cublas64_12.dll`): see [cuBLAS](#cublas-phase-3d) below. Since Phase 3e it
+also replaces the **driver library** (`libcuda.so.1` / `nvcuda.dll`): see
+[Driver API](#driver-api-phase-3e). With the three, an unmodified PyTorch on
+a client with no NVIDIA GPU sees the server's GPU (plan milestone 4).
 
 ## What crosses the wire
 
@@ -88,6 +91,41 @@ back-to-back 1024² SGEMMs run at **5658 GFlop/s natively, 5647 through Tuna
 (plaintext) and 5493 (mTLS)**, with bit-identical results: posted calls keep
 the GPU fed.
 
+## Driver API (Phase 3e)
+
+Programs rarely call the driver API, but frameworks and NVIDIA's libraries
+do. PyTorch checks `cuDevicePrimaryCtxGetState` before every op, and makes the
+primary context current (`cuCtxGetCurrent` / `cuDevicePrimaryCtxRetain` /
+`cuCtxSetCurrent`) before creating a cuBLAS handle. It does both through
+`libcaffe2_nvrtc.so`, which links `libcuda.so.1` directly. On a client without
+a GPU, that library must be Tuna's too.
+
+- `libcuda.so.1` (Tuna's) exports the full driver ABI (652 symbols, taken from
+  the r571 driver) and sends through the runtime shim's bridge, like libcublas.
+- Remoted (11): `cuInit`, `cuDriverGetVersion`, `cuDeviceGet`,
+  `cuDeviceGetCount`, `cuDeviceGetName`, `cuDeviceGetAttribute`,
+  `cuDeviceTotalMem`, `cuDeviceGetUuid`, `cuDevicePrimaryCtxGetState`,
+  `cuDevicePrimaryCtxSetFlags`, `cuDevicePrimaryCtxRetain`. Attributes are
+  cached, and so is a primary-context state once it is *active*. The runtime
+  shim's context generation invalidates the latter on `cudaDeviceReset`. So
+  PyTorch's per-op check costs no round trip.
+- **Contexts are client-side tokens.** A `CUcontext` is a host pointer in the
+  server's worker, so it never crosses the wire. The generated driver calls
+  take only scalars: `gen_cuda.py` refuses any handle other than
+  `CUdeviceptr` / `CUstream`. Only primary contexts exist, one token per
+  device. A thread makes a token current itself (`cuCtxSetCurrent`, push/pop).
+  A thread that set none sees the runtime's current device's primary context
+  once it is active, which is what CUDA does after the runtime's first call.
+  Making a token current also switches the runtime's device, since all client
+  threads share one server thread.
+- `cuGetProcAddress` returns the shim's own exports (the newest `_vN` variant
+  of the base name), so nothing that looks up the driver reaches past Tuna.
+  Error names and strings are local. Everything else returns
+  `CUDA_ERROR_NOT_SUPPORTED` and is logged with `TUNA_LOG=1`.
+- The server initializes its driver (`cuInit`) before the first driver call
+  and keeps each primary context it retained for the rest of the session. It
+  refuses a `driver_library` that is Tuna's own shim.
+
 ## Files
 
 | File | Role |
@@ -97,22 +135,28 @@ the GPU fed.
 | `include/tuna/cuda/backend.h` | `CudaBackend` (symbol source) and `CudaSession` (server state) |
 | `include/tuna/cuda/bridge.h` | `tuna_cudart_call`: the C bridge library shims send through |
 | `include/tuna/cuda/cublas_client.h` | cuBLAS shim plumbing (call/post, status mapping, scalar refs) |
+| `include/tuna/cuda/driver_client.h` | driver shim plumbing (call, CUresult codes) |
 | `src/client.cpp` | session (lazy connect from env), call/post, last error |
 | `src/client_runtime.cpp` | memcpy family, host memory, caches, error strings |
 | `src/client_launch.cpp` | fatbin/kernel/variable registration, launch, symbols |
 | `src/client_unsupported.cpp` | the generated not-supported exports |
 | `src/cublas_client.cpp` | cuBLAS shim: handles + pointer modes, matrix/vector copies, status strings |
 | `src/cublas_unsupported.cpp` | the generated not-supported cuBLAS exports |
+| `src/driver_client.cpp` | driver shim: context tokens, cached device queries, error strings, `cuGetProcAddress` |
+| `src/driver_unsupported.cpp` | the generated not-supported driver exports |
 | `src/dispatch.cpp` | server: `CudaSession::Dispatch` (generated switch + hand-written calls) |
 | `src/dispatch_cublas.cpp` | server: cuBLAS (generated switch + matrix copies, async status mapping) |
+| `src/dispatch_driver.cpp` | server: driver API (generated switch + primary-context retain, device name) |
 | `src/backend_real.cpp` | `dlopen` of NVIDIA's libcudart + libcuda (+ libcublas on first use); refuses to load Tuna's shims |
-| `libcudart.map`, `libcublas.map` | Linux version scripts (export only the CUDA / cuBLAS API) |
+| `libcudart.map`, `libcublas.map`, `libcuda.map` | Linux version scripts (export only the CUDA / cuBLAS / driver API) |
 | `generated/` | committed codegen output (CI checks it is current) |
 | `samples/*.cu` | real-GPU milestone programs (deviceQuery, vectorAdd, matrixMul, symbols/streams, cuBLAS sgemm) |
-| `tests/test_marshal.cpp`, `tests/test_cublas.cpp` | GPU-free round trips through `CudaSession` + the mock |
+| `samples/torch_*.py` | PyTorch milestone programs (4: matmul; 5: a training loop) |
+| `tests/test_marshal.cpp`, `tests/test_cublas.cpp`, `tests/test_driver.cpp` | GPU-free round trips through `CudaSession` + the mock |
 | `tests/mock_cuda.cpp` | mock CUDA stack: device memory in host buffers, three kernels, one `__constant__`, a small cuBLAS |
-| `tests/e2e_client.cpp`, `tests/e2e_cublas_client.cpp` + `tests/integration/test_cuda_e2e.py` | real binaries end to end (TCP and mTLS), mock instead of a GPU |
+| `tests/e2e_client.cpp`, `tests/e2e_cublas_client.cpp`, `tests/e2e_driver_client.cpp` + `tests/integration/test_cuda_e2e.py` | real binaries end to end (TCP and mTLS), mock instead of a GPU |
 | `tests/integration/test_gpu_samples.py` | nvcc-built samples natively and through Tuna on a real GPU |
+| `tests/integration/test_torch.py` | PyTorch samples natively and through Tuna on a real GPU, with the client's own GPU hidden |
 | `tests/real_gpu_probe.cpp` | in-process probe of the real GPU through the dispatch |
 
 ## Build and test
@@ -141,6 +185,17 @@ python3 cuda/tests/integration/test_gpu_samples.py --server build/tuna_server \
     [--cublas-dir DIR] [--mtls]
 ```
 
+PyTorch (milestones 4 and 5) works with any CUDA 12 build of torch, e.g.
+`pip install torch --index-url https://download.pytorch.org/whl/cu128`. The
+server's runtime and cuBLAS come from the same install's `nvidia-*` wheels.
+The client's own GPU is hidden in a user + mount namespace, so nothing can
+silently bypass Tuna:
+
+```bash
+python3 cuda/tests/integration/test_torch.py --server build/tuna_server \
+    --shim-dir build/shim --python /path/to/venv/bin/python [--only torch_matmul] [--mtls]
+```
+
 ## Run an application through Tuna (by hand)
 
 ```bash
@@ -151,7 +206,15 @@ python3 cuda/tests/integration/test_gpu_samples.py --server build/tuna_server \
 export TUNA_SERVER=gpu-box:7000
 export TUNA_CA_CERT=ca.crt TUNA_CLIENT_CERT=alice.crt TUNA_CLIENT_KEY=alice.key  # mTLS
 LD_LIBRARY_PATH=/path/to/build/shim ./my_cuda_app
+# Libraries that find CUDA through RPATH (PyTorch's) ignore LD_LIBRARY_PATH:
+S=/path/to/build/shim
+LD_PRELOAD=$S/libcudart.so.12:$S/libcublas.so.12:$S/libcuda.so.1 python train.py
 ```
+
+On Windows, put the shim DLLs **next to the application's .exe**. Windows
+loads `nvcuda.dll` from System32 before anything on `PATH`, so on a machine
+with an NVIDIA driver only the application's own directory wins. Phase 5's
+`tuna run` will set this up.
 
 Variables: `TUNA_SERVER` (required), `TUNA_CA_CERT` / `TUNA_CLIENT_CERT` /
 `TUNA_CLIENT_KEY` (all or none; none only works against a loopback server),
@@ -176,7 +239,12 @@ already handle as "no GPU".
   from the launch or `cudaGetLastError`.
 - Libraries that bundle their own GPU code paths without going through
   libcudart need their own API shims. cuBLAS has one (Phase 3d); cuBLASLt,
-  cuDNN, cuFFT, cuRAND, cuSPARSE and NCCL do not yet (PyTorch needs several).
+  cuDNN, cuFFT, cuRAND, cuSPARSE and NCCL do not yet. PyTorch needs several:
+  `nn.Linear` with a bias goes through cuBLASLt, convolutions through cuDNN.
+- Driver API: primary contexts only (`cuCtxCreate` is not supported). Modules
+  loaded through the driver (`cuModuleLoadData`, which PyTorch's JIT
+  "jiterator" kernels use) are not supported yet. `cuGetProcAddress` ignores
+  the per-thread-default-stream flag.
 - cuBLAS: a BLAS call's argument errors are reported by the next synchronizing
   CUDA call (as a `cudaError_t`), not by the call itself, which returns
   `CUBLAS_STATUS_SUCCESS` once queued. Host↔device matrix copies validate
@@ -184,8 +252,9 @@ already handle as "no GPU".
 
 ## Add a function
 
-1. Add it to `tools/codegen/annotations.yaml` (runtime) or
-   `tools/codegen/annotations_cublas.yaml` (cuBLAS). Every parameter needs a
+1. Add it to `tools/codegen/annotations.yaml` (runtime),
+   `tools/codegen/annotations_cublas.yaml` (cuBLAS) or
+   `tools/codegen/annotations_driver.yaml` (driver). Every parameter needs a
    role; mark fire-and-forget calls `_async`, synchronizing ones `_sync`;
    cuBLAS scalars are `in_scalar_ref` / `out_scalar_ref`.
 2. Regenerate: `python tools/codegen/gen_cuda.py <cuda-12>/include

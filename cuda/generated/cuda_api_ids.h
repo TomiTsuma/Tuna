@@ -99,7 +99,19 @@ enum TunaCudaApi : uint32_t {
     kApi_cublasSgemv_v2 = 94,
     kApi_cublasSnrm2_v2 = 95,
     kApi_cublasSscal_v2 = 96,
+    kApi_cudaStreamIsCapturing = 97,
+    kApi_cuDeviceGet = 98,
+    kApi_cuDeviceGetAttribute = 99,
+    kApi_cuDeviceGetCount = 100,
+    kApi_cuDeviceGetName = 101,
+    kApi_cuDeviceGetUuid_v2 = 102,
+    kApi_cuDevicePrimaryCtxGetState = 103,
+    kApi_cuDevicePrimaryCtxRetain = 104,
+    kApi_cuDevicePrimaryCtxSetFlags_v2 = 105,
+    kApi_cuDeviceTotalMem_v2 = 106,
+    kApi_cuDriverGetVersion = 107,
+    kApi_cuInit = 108,
 };
 constexpr uint32_t kFirstCudaApi = 1;
-constexpr uint32_t kLastCudaApi = 96;
+constexpr uint32_t kLastCudaApi = 108;
 }  // namespace tuna::cudart

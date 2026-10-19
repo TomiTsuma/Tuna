@@ -12,6 +12,9 @@
 // Kernels execute synchronously on the host with real grid/block bounds, so
 // launch-configuration bugs show up as wrong results.
 //
+// Driver API: cuInit, device queries (failing before cuInit, as the real
+// driver does), and primary-context state/retain/flags.
+//
 // With cuBLAS headers (TUNA_CUDA_HAVE_CUBLAS) it also models a small cuBLAS:
 // handles with a stream and pointer mode, column-major S/D gemm (plain,
 // strided-batched, GemmEx for fp32), axpy, scal, dot, nrm2 and the
@@ -67,6 +70,8 @@ struct MockDevice {
     int device_count = 2;
     int current_device = 0;
     bool initialized = false;
+    bool driver_initialized = false;          // cuInit called
+    std::map<int, unsigned> retained_primary;  // device -> primary context flags (retained)
     size_t total_mem = 8ull << 30;
     std::map<uint64_t, Module> modules;
     std::map<uint64_t, Function> functions;
@@ -172,6 +177,7 @@ cudaError_t DriverGetVersion(int* version) {
 cudaError_t Malloc(void** ptr, size_t size) {
     if (size > g.total_mem - UsedMemory()) return cudaErrorMemoryAllocation;
     *ptr = reinterpret_cast<void*>(Allocate(size));
+    g.initialized = true;  // like the real runtime, the first allocation creates the context
     return cudaSuccess;
 }
 
@@ -263,6 +269,83 @@ cudaError_t GetLastError() { return cudaSuccess; }
 
 CUresult CtxGetCurrent(CUcontext* ctx) {
     *ctx = g.initialized ? reinterpret_cast<CUcontext>(0xC000 + g.current_device) : nullptr;
+    return CUDA_SUCCESS;
+}
+
+CUresult Init(unsigned flags) {
+    if (flags != 0) return CUDA_ERROR_INVALID_VALUE;
+    g.driver_initialized = true;
+    return CUDA_SUCCESS;
+}
+
+// Like the real driver, every device query fails before cuInit.
+CUresult CheckDevice(CUdevice dev) {
+    if (!g.driver_initialized) return CUDA_ERROR_NOT_INITIALIZED;
+    ++g.stats.driver_queries;
+    return dev < 0 || dev >= g.device_count ? CUDA_ERROR_INVALID_DEVICE : CUDA_SUCCESS;
+}
+
+CUresult DriverGetVersionDrv(int* version) {
+    *version = 12080;
+    return CUDA_SUCCESS;
+}
+
+CUresult DeviceGet(CUdevice* device, int ordinal) {
+    if (CUresult r = CheckDevice(ordinal)) return r;
+    *device = ordinal;
+    return CUDA_SUCCESS;
+}
+
+CUresult DeviceGetCount(int* count) {
+    if (!g.driver_initialized) return CUDA_ERROR_NOT_INITIALIZED;
+    *count = g.device_count;
+    return CUDA_SUCCESS;
+}
+
+CUresult DeviceGetAttributeDrv(int* value, CUdevice_attribute attr, CUdevice dev) {
+    if (CUresult r = CheckDevice(dev)) return r;
+    // The runtime's attribute ids are the driver's.
+    return static_cast<CUresult>(DeviceGetAttribute(value, static_cast<cudaDeviceAttr>(attr), dev));
+}
+
+CUresult DeviceTotalMem(size_t* bytes, CUdevice dev) {
+    if (CUresult r = CheckDevice(dev)) return r;
+    *bytes = g.total_mem;
+    return CUDA_SUCCESS;
+}
+
+CUresult DeviceGetUuid(CUuuid* uuid, CUdevice dev) {
+    if (CUresult r = CheckDevice(dev)) return r;
+    for (int i = 0; i < 16; ++i) uuid->bytes[i] = static_cast<char>(0xA0 + i + dev);
+    return CUDA_SUCCESS;
+}
+
+CUresult DeviceGetName(char* name, int len, CUdevice dev) {
+    if (CUresult r = CheckDevice(dev)) return r;
+    std::snprintf(name, static_cast<size_t>(len), "Tuna Mock GPU %d", dev);
+    return CUDA_SUCCESS;
+}
+
+// A device's primary context is active once the runtime initialized it (on the
+// current device) or someone retained it.
+CUresult PrimaryCtxGetState(CUdevice dev, unsigned* flags, int* active) {
+    if (CUresult r = CheckDevice(dev)) return r;
+    auto it = g.retained_primary.find(dev);
+    *flags = it == g.retained_primary.end() ? 0 : it->second;
+    *active = it != g.retained_primary.end() || (g.initialized && dev == g.current_device);
+    return CUDA_SUCCESS;
+}
+
+CUresult PrimaryCtxSetFlags(CUdevice dev, unsigned flags) {
+    if (CUresult r = CheckDevice(dev)) return r;
+    g.retained_primary[dev] = flags;
+    return CUDA_SUCCESS;
+}
+
+CUresult PrimaryCtxRetain(CUcontext* ctx, CUdevice dev) {
+    if (CUresult r = CheckDevice(dev)) return r;
+    g.retained_primary.emplace(dev, 0);
+    *ctx = reinterpret_cast<CUcontext>(0xC000 + dev);
     return CUDA_SUCCESS;
 }
 
@@ -671,6 +754,17 @@ const Entry kEntries[] = {
     TUNA_MOCK("cudaGetLastError", GetLastError),
     TUNA_MOCK("cudaPeekAtLastError", GetLastError),
     TUNA_MOCK("cuCtxGetCurrent", CtxGetCurrent),
+    TUNA_MOCK("cuInit", Init),
+    TUNA_MOCK("cuDriverGetVersion", DriverGetVersionDrv),
+    TUNA_MOCK("cuDeviceGet", DeviceGet),
+    TUNA_MOCK("cuDeviceGetCount", DeviceGetCount),
+    TUNA_MOCK("cuDeviceGetAttribute", DeviceGetAttributeDrv),
+    TUNA_MOCK("cuDeviceTotalMem_v2", DeviceTotalMem),
+    TUNA_MOCK("cuDeviceGetUuid_v2", DeviceGetUuid),
+    TUNA_MOCK("cuDeviceGetName", DeviceGetName),
+    TUNA_MOCK("cuDevicePrimaryCtxGetState", PrimaryCtxGetState),
+    TUNA_MOCK("cuDevicePrimaryCtxSetFlags_v2", PrimaryCtxSetFlags),
+    TUNA_MOCK("cuDevicePrimaryCtxRetain", PrimaryCtxRetain),
     TUNA_MOCK("cuModuleLoadData", ModuleLoadData),
     TUNA_MOCK("cuModuleGetFunction", ModuleGetFunction),
     TUNA_MOCK("cuModuleGetGlobal_v2", ModuleGetGlobal),
