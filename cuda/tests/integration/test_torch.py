@@ -4,8 +4,8 @@ milestones 4 and 5).
 
 Runs each cuda/samples/torch_*.py twice with the same Python + PyTorch:
   native - on the local GPU (the reference);
-  tuna   - with Tuna's libcudart.so.12, libcublas.so.12 and libcuda.so.1
-           preloaded, against a local tuna_server whose worker runs NVIDIA's
+  tuna   - with Tuna's libcudart.so.12, libcublas.so.12, libcublasLt.so.12 and
+           libcuda.so.1 preloaded, against a local tuna_server whose worker runs NVIDIA's
            runtime and cuBLAS (from the same PyTorch install) on that GPU.
 
 By default the Tuna run also has **no GPU of its own**: on Linux the client is
@@ -109,7 +109,8 @@ def main():
     if args.only:
         samples = [s for s in samples if s.stem in args.only]
     shim = Path(args.shim_dir)
-    preload = ":".join(str(shim / name) for name in ("libcudart.so.12", "libcublas.so.12", "libcuda.so.1"))
+    preload = ":".join(str(shim / name) for name in ("libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12",
+                                                     "libcuda.so.1"))
     hide_gpu = not args.keep_gpu
     if hide_gpu and subprocess.run(without_gpu(["true"]), capture_output=True).returncode != 0:
         raise SystemExit("cannot hide the GPU (unprivileged user namespaces unavailable); use --keep-gpu")

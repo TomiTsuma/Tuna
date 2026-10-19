@@ -144,6 +144,27 @@ bool IsDevicePointer(const void* ptr) {
     return p < it->first + it->second;
 }
 
+int32_t ValidateLaunch(uint32_t grid_x, uint32_t grid_y, uint32_t grid_z, uint32_t block_x, uint32_t block_y,
+                       uint32_t block_z) {
+    int device = 0;
+    cudaDeviceProp prop{};
+    // Both are cached after their first answer. If they cannot be had, the
+    // server checks the launch instead (reported at the next sync).
+    if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties_v2(&prop, device) != cudaSuccess) {
+        LastError(/*clear=*/true);
+        return 0;
+    }
+    const uint64_t threads = uint64_t{block_x} * block_y * block_z;
+    const bool block_ok = block_x && block_y && block_z && threads <= static_cast<uint64_t>(prop.maxThreadsPerBlock) &&
+                          block_x <= static_cast<uint32_t>(prop.maxThreadsDim[0]) &&
+                          block_y <= static_cast<uint32_t>(prop.maxThreadsDim[1]) &&
+                          block_z <= static_cast<uint32_t>(prop.maxThreadsDim[2]);
+    const bool grid_ok = grid_x && grid_y && grid_z && grid_x <= static_cast<uint32_t>(prop.maxGridSize[0]) &&
+                         grid_y <= static_cast<uint32_t>(prop.maxGridSize[1]) &&
+                         grid_z <= static_cast<uint32_t>(prop.maxGridSize[2]);
+    return block_ok && grid_ok ? 0 : static_cast<int32_t>(cudaErrorInvalidConfiguration);
+}
+
 void ResetRuntimeState() {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_device_ranges.clear();
@@ -219,6 +240,26 @@ TUNA_CUDART_EXPORT cudaError_t cudaHostGetFlags(unsigned int* pFlags, void* pHos
 
 // --------------------------------------------- device state (wrapped stubs)
 
+// The current device changes only through cudaSetDevice, which this shim
+// sees, and every client thread shares one server thread, so after the first
+// answer it is known here. PyTorch asks hundreds of times per training step.
+TUNA_CUDART_EXPORT cudaError_t cudaGetDevice(int* device) {
+    if (!device) return static_cast<cudaError_t>(Fail(cudaErrorInvalidValue));
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_current_device != -1) {
+            *device = g_current_device;
+            return cudaSuccess;
+        }
+    }
+    cudaError_t e = tuna_remote_cudaGetDevice(device);
+    if (e == cudaSuccess) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_current_device == -1) g_current_device = *device;
+    }
+    return e;
+}
+
 TUNA_CUDART_EXPORT cudaError_t cudaSetDevice(int device) {
     cudaError_t e = tuna_remote_cudaSetDevice(device);
     if (e == cudaSuccess) {
@@ -284,10 +325,16 @@ TUNA_CUDART_EXPORT cudaError_t cudaDeviceReset(void) {
 // ------------------------------------------------------------------ errors
 
 // The client's own last error (a failed call it made, or one it rejected
-// locally) wins; otherwise the server runtime's, which also flushes and
-// reports any failed fire-and-forget call.
+// locally) wins; otherwise the failure of a fire-and-forget call whose answer
+// has already arrived. No round trip: frameworks call this after every kernel
+// launch (PyTorch's C10_CUDA_KERNEL_LAUNCH_CHECK), so waiting here would cost
+// one round trip per kernel. A failure still in flight is reported by the next
+// synchronizing call instead, as with any asynchronous error. With
+// CUDA_LAUNCH_BLOCKING set it asks the server, which flushes and reports
+// every queued call's failure, so a bad launch is caught where it happened.
 TUNA_CUDART_EXPORT cudaError_t cudaGetLastError(void) {
     const int32_t local = LastError(/*clear=*/true);
+    if (!LaunchBlocking()) return static_cast<cudaError_t>(local ? local : ArrivedAsyncError(/*clear=*/true));
     Reply reply = Call(kApi_cudaGetLastError, ArgWriter{}, {}, /*synchronizing=*/true);
     const int32_t remote = reply.transport_error ? kErrUnknown : reply.result;
     return static_cast<cudaError_t>(local ? local : remote);
@@ -296,6 +343,7 @@ TUNA_CUDART_EXPORT cudaError_t cudaGetLastError(void) {
 TUNA_CUDART_EXPORT cudaError_t cudaPeekAtLastError(void) {
     const int32_t local = LastError(/*clear=*/false);
     if (local) return static_cast<cudaError_t>(local);
+    if (!LaunchBlocking()) return static_cast<cudaError_t>(ArrivedAsyncError(/*clear=*/false));
     Reply reply = Call(kApi_cudaPeekAtLastError, ArgWriter{}, {}, /*synchronizing=*/true);
     const int32_t remote = reply.transport_error ? kErrUnknown : reply.result;
     if (remote) Fail(remote);  // a latched async error stays visible until cleared
@@ -317,6 +365,14 @@ TUNA_CUDART_EXPORT const char* cudaGetErrorString(cudaError_t error) {
 TUNA_CUDART_EXPORT cudaError_t cudaRuntimeGetVersion(int* runtimeVersion) {
     if (!runtimeVersion) return static_cast<cudaError_t>(Fail(cudaErrorInvalidValue));
     *runtimeVersion = CUDART_VERSION;  // the runtime ABI this shim implements
+    return cudaSuccess;
+}
+
+// Graph capture is not supported (cudaStreamBeginCapture is a not-supported
+// stub), so no stream is ever capturing.
+TUNA_CUDART_EXPORT cudaError_t cudaStreamIsCapturing(cudaStream_t, cudaStreamCaptureStatus* pCaptureStatus) {
+    if (!pCaptureStatus) return static_cast<cudaError_t>(Fail(cudaErrorInvalidValue));
+    *pCaptureStatus = cudaStreamCaptureStatusNone;
     return cudaSuccess;
 }
 

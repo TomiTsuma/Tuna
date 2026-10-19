@@ -476,19 +476,6 @@
         resp.set_out_args(out.str());
         break;
     }
-    case kApi_cudaStreamIsCapturing: {  // cudaStreamIsCapturing
-        tuna::cudart::ArgReader in(request.args());
-        cudaStream_t stream = reinterpret_cast<cudaStream_t>(in.get_u64());
-        enum cudaStreamCaptureStatus pCaptureStatus{};
-        if (in.remaining() != 0) { resp.set_result(kCudaErrorInvalidValue); break; }
-        auto fn = reinterpret_cast<cudaError_t (*)(cudaStream_t, enum cudaStreamCaptureStatus *)>(backend_.Resolve("cudaStreamIsCapturing"));
-        if (!fn) { resp.set_result(kCudaErrorNotSupported); break; }
-        resp.set_result(fn(stream, &pCaptureStatus));
-        tuna::cudart::ArgWriter out;
-        out.put(&pCaptureStatus, 4);
-        resp.set_out_args(out.str());
-        break;
-    }
     case kApi_cudaStreamQuery: {  // cudaStreamQuery
         tuna::cudart::ArgReader in(request.args());
         cudaStream_t stream = reinterpret_cast<cudaStream_t>(in.get_u64());

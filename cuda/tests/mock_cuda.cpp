@@ -15,7 +15,8 @@
 // Driver API: cuInit, device queries (failing before cuInit, as the real
 // driver does), and primary-context state/retain/flags.
 //
-// With cuBLAS headers (TUNA_CUDA_HAVE_CUBLAS) it also models a small cuBLAS:
+// With cuBLAS headers (TUNA_CUDA_HAVE_CUBLAS) it also models a small cuBLAS
+// (and a cuBLASLt matmul with bias/ReLU epilogues, at the end of the file):
 // handles with a stream and pointer mode, column-major S/D gemm (plain,
 // strided-batched, GemmEx for fp32), axpy, scal, dot, nrm2 and the
 // host<->device matrix copies, computed on the host from "device" memory.
@@ -31,6 +32,7 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #ifdef TUNA_CUDA_HAVE_CUBLAS
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #endif
 
@@ -64,6 +66,23 @@ struct BlasHandle {
     int math_mode = 0;
 };
 
+#ifdef TUNA_CUDA_HAVE_CUBLAS
+struct LtDesc {
+    cudaDataType_t scale_type = CUDA_R_32F;
+    int32_t pointer_mode = CUBLASLT_POINTER_MODE_HOST;
+    int32_t transa = CUBLAS_OP_N, transb = CUBLAS_OP_N;
+    int32_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
+    uint64_t bias = 0;
+};
+
+struct LtLayout {
+    cudaDataType type;
+    uint64_t rows, cols;
+    int64_t ld;
+    int32_t batch = 1;
+};
+#endif
+
 struct MockDevice {
     std::map<uint64_t, std::vector<char>> buffers;  // device address -> bytes
     uint64_t next_address = 0x7f0000100000ull;
@@ -77,6 +96,12 @@ struct MockDevice {
     std::map<uint64_t, Function> functions;
     std::map<uint64_t, Event> events;
     std::map<uint64_t, BlasHandle> blas_handles;
+#ifdef TUNA_CUDA_HAVE_CUBLAS
+    std::map<uint64_t, LtDesc> lt_descs;
+    std::map<uint64_t, LtLayout> lt_layouts;
+    std::map<uint64_t, uint64_t> lt_prefs;  // -> max workspace bytes
+    std::map<uint64_t, bool> lt_handles;
+#endif
     uint64_t next_handle = 0x5000;
     uint64_t sequence = 0;
     MockCudaStats stats;
@@ -152,6 +177,11 @@ cudaError_t GetDeviceProperties(cudaDeviceProp* prop, int device) {
     prop->multiProcessorCount = 20;
     prop->maxThreadsPerBlock = 1024;
     prop->warpSize = 32;
+    prop->maxThreadsDim[0] = prop->maxThreadsDim[1] = 1024;
+    prop->maxThreadsDim[2] = 64;
+    prop->maxGridSize[0] = 0x7fffffff;
+    prop->maxGridSize[1] = prop->maxGridSize[2] = 65535;
+    prop->sharedMemPerBlock = 48 << 10;
     return cudaSuccess;
 }
 
@@ -406,10 +436,13 @@ T Param(void** params, int index) {
 }
 
 CUresult LaunchKernel(CUfunction function, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
-                      unsigned bz, unsigned, CUstream, void** params, void**) {
+                      unsigned bz, unsigned shared_mem, CUstream, void** params, void**) {
     auto it = g.functions.find(reinterpret_cast<uint64_t>(function));
     if (it == g.functions.end()) return CUDA_ERROR_INVALID_HANDLE;
     if (bx * by * bz > 1024 || bx * by * bz == 0 || gx * gy * gz == 0) return CUDA_ERROR_INVALID_VALUE;
+    // More dynamic shared memory than the kernel may use: a failure only the
+    // device side can see (it depends on the function's attributes).
+    if (shared_mem > (48u << 10)) return CUDA_ERROR_INVALID_VALUE;
     ++g.stats.launches;
     const uint64_t threads = uint64_t{gx} * gy * gz * bx * by * bz;
     const std::string& name = it->second.name;
@@ -717,6 +750,214 @@ cublasStatus_t BlasGetMatrixAsync(int rows, int cols, int elem, const void* a, i
                                   cudaStream_t) {
     return BlasGetMatrix(rows, cols, elem, a, lda, b, ldb);
 }
+// ----------------------------------------------------------------- cuBLASLt
+//
+// Enough of cuBLASLt for PyTorch's addmm path: fp32 matmul descriptors with
+// transposes, a bias / ReLU epilogue and either pointer mode, column-major
+// layouts, one heuristic result (a tagged algo), and the matmul itself.
+
+constexpr uint64_t kMockAlgoTag = 0x7A1607A1ull;
+
+template <typename T>
+T* LtObject(std::map<uint64_t, T>& objects, const void* id) {
+    auto it = objects.find(reinterpret_cast<uint64_t>(id));
+    return it == objects.end() ? nullptr : &it->second;
+}
+
+cublasStatus_t LtCreate(cublasLtHandle_t* handle) {
+    const uint64_t h = g.next_handle++;
+    g.lt_handles[h] = true;
+    *handle = reinterpret_cast<cublasLtHandle_t>(h);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t LtDestroy(cublasLtHandle_t handle) {
+    return g.lt_handles.erase(reinterpret_cast<uint64_t>(handle)) ? CUBLAS_STATUS_SUCCESS
+                                                                   : CUBLAS_STATUS_NOT_INITIALIZED;
+}
+
+// A cuBLAS handle works as an Lt handle, as with the real libraries.
+bool LtHandleKnown(cublasLtHandle_t handle) {
+    const auto h = reinterpret_cast<uint64_t>(handle);
+    return g.lt_handles.count(h) || g.blas_handles.count(h);
+}
+
+cublasStatus_t LtDescCreate(cublasLtMatmulDesc_t* desc, cublasComputeType_t, cudaDataType_t scale) {
+    const uint64_t id = g.next_handle++;
+    LtDesc d;
+    d.scale_type = scale;
+    g.lt_descs[id] = d;
+    *desc = reinterpret_cast<cublasLtMatmulDesc_t>(id);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t LtDescDestroy(cublasLtMatmulDesc_t desc) {
+    return g.lt_descs.erase(reinterpret_cast<uint64_t>(desc)) ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+}
+
+// Attribute values must have their exact size, as in cuBLASLt.
+template <typename T>
+bool SetValue(T* field, const void* buf, size_t size) {
+    if (size != sizeof(T)) return false;
+    std::memcpy(field, buf, sizeof(T));
+    return true;
+}
+
+cublasStatus_t LtDescSetAttribute(cublasLtMatmulDesc_t desc, cublasLtMatmulDescAttributes_t attr, const void* buf,
+                                  size_t size) {
+    LtDesc* d = LtObject(g.lt_descs, desc);
+    if (!d || !buf) return CUBLAS_STATUS_INVALID_VALUE;
+    bool ok = true;
+    switch (attr) {
+    case CUBLASLT_MATMUL_DESC_TRANSA: ok = SetValue(&d->transa, buf, size); break;
+    case CUBLASLT_MATMUL_DESC_TRANSB: ok = SetValue(&d->transb, buf, size); break;
+    case CUBLASLT_MATMUL_DESC_EPILOGUE: ok = SetValue(&d->epilogue, buf, size); break;
+    case CUBLASLT_MATMUL_DESC_BIAS_POINTER: ok = SetValue(&d->bias, buf, size); break;
+    case CUBLASLT_MATMUL_DESC_POINTER_MODE: ok = SetValue(&d->pointer_mode, buf, size); break;
+    case CUBLASLT_MATMUL_DESC_SCALE_TYPE: ok = SetValue(&d->scale_type, buf, size); break;
+    default: break;  // accepted and ignored
+    }
+    return ok ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+}
+
+cublasStatus_t LtLayoutCreate(cublasLtMatrixLayout_t* layout, cudaDataType type, uint64_t rows, uint64_t cols,
+                              int64_t ld) {
+    if (ld < static_cast<int64_t>(std::max<uint64_t>(1, rows))) return CUBLAS_STATUS_INVALID_VALUE;
+    const uint64_t id = g.next_handle++;
+    g.lt_layouts[id] = LtLayout{type, rows, cols, ld};
+    *layout = reinterpret_cast<cublasLtMatrixLayout_t>(id);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t LtLayoutDestroy(cublasLtMatrixLayout_t layout) {
+    return g.lt_layouts.erase(reinterpret_cast<uint64_t>(layout)) ? CUBLAS_STATUS_SUCCESS
+                                                                   : CUBLAS_STATUS_INVALID_VALUE;
+}
+
+cublasStatus_t LtLayoutSetAttribute(cublasLtMatrixLayout_t layout, cublasLtMatrixLayoutAttribute_t attr,
+                                    const void* buf, size_t size) {
+    LtLayout* l = LtObject(g.lt_layouts, layout);
+    if (!l || !buf) return CUBLAS_STATUS_INVALID_VALUE;
+    if (attr == CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT && !SetValue(&l->batch, buf, size)) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t LtPrefCreate(cublasLtMatmulPreference_t* pref) {
+    const uint64_t id = g.next_handle++;
+    g.lt_prefs[id] = 0;
+    *pref = reinterpret_cast<cublasLtMatmulPreference_t>(id);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t LtPrefDestroy(cublasLtMatmulPreference_t pref) {
+    return g.lt_prefs.erase(reinterpret_cast<uint64_t>(pref)) ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+}
+
+cublasStatus_t LtPrefSetAttribute(cublasLtMatmulPreference_t pref, cublasLtMatmulPreferenceAttributes_t attr,
+                                  const void* buf, size_t size) {
+    uint64_t* workspace = LtObject(g.lt_prefs, pref);
+    if (!workspace || !buf) return CUBLAS_STATUS_INVALID_VALUE;
+    if (attr == CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES && !SetValue(workspace, buf, size)) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t LtHeuristic(cublasLtHandle_t handle, cublasLtMatmulDesc_t desc, cublasLtMatrixLayout_t a,
+                           cublasLtMatrixLayout_t b, cublasLtMatrixLayout_t c, cublasLtMatrixLayout_t d,
+                           cublasLtMatmulPreference_t pref, int requested, cublasLtMatmulHeuristicResult_t* results,
+                           int* count) {
+    if (!LtHandleKnown(handle)) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (!LtObject(g.lt_descs, desc) || !LtObject(g.lt_layouts, a) || !LtObject(g.lt_layouts, b) ||
+        !LtObject(g.lt_layouts, c) || !LtObject(g.lt_layouts, d) || !LtObject(g.lt_prefs, pref) || requested < 1) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    std::memset(results, 0, sizeof(*results));
+    results[0].algo.data[0] = kMockAlgoTag;
+    results[0].state = CUBLAS_STATUS_SUCCESS;
+    results[0].wavesCount = 1.0f;
+    *count = 1;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+// One scalar from host memory or the mock's device memory.
+bool LtScalar(const void* p, bool on_device, float* value) {
+    if (!p) return false;
+    const float* source = on_device ? Device<float>(reinterpret_cast<uint64_t>(p), 1) : static_cast<const float*>(p);
+    if (!source) return false;
+    *value = *source;
+    return true;
+}
+
+// D = epilogue(alpha * op(A) op(B) + beta * C [+ bias per row]), fp32, column-major.
+cublasStatus_t LtMatmul(cublasLtHandle_t handle, cublasLtMatmulDesc_t desc_id, const void* alpha_p, const void* a_p,
+                        cublasLtMatrixLayout_t a_id, const void* b_p, cublasLtMatrixLayout_t b_id, const void* beta_p,
+                        const void* c_p, cublasLtMatrixLayout_t c_id, void* d_p, cublasLtMatrixLayout_t d_id,
+                        const cublasLtMatmulAlgo_t* algo, void*, size_t, cudaStream_t) {
+    if (!LtHandleKnown(handle)) return CUBLAS_STATUS_NOT_INITIALIZED;
+    const LtDesc* desc = LtObject(g.lt_descs, desc_id);
+    const LtLayout* la = LtObject(g.lt_layouts, a_id);
+    const LtLayout* lb = LtObject(g.lt_layouts, b_id);
+    const LtLayout* lc = LtObject(g.lt_layouts, c_id);
+    const LtLayout* ld = LtObject(g.lt_layouts, d_id);
+    if (!desc || !la || !lb || !lc || !ld || (algo && algo->data[0] != kMockAlgoTag)) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    for (const LtLayout* l : {la, lb, lc, ld}) {
+        if (l->type != CUDA_R_32F || l->batch != 1) return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    if (desc->scale_type != CUDA_R_32F) return CUBLAS_STATUS_NOT_SUPPORTED;
+    const bool at = desc->transa != CUBLAS_OP_N;
+    const bool bt = desc->transb != CUBLAS_OP_N;
+    const uint64_t m = ld->rows, n = ld->cols;
+    const uint64_t k = at ? la->rows : la->cols;
+    if ((at ? la->cols : la->rows) != m || (bt ? lb->cols : lb->rows) != k || (bt ? lb->rows : lb->cols) != n ||
+        lc->rows != m || lc->cols != n) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    // alpha follows the pointer mode; beta is on the device only in the
+    // DEVICE mode (the mock models scalars, not the vector modes).
+    float alpha = 0, beta = 0;
+    if (!LtScalar(alpha_p, desc->pointer_mode != CUBLASLT_POINTER_MODE_HOST, &alpha) ||
+        !LtScalar(beta_p, desc->pointer_mode == CUBLASLT_POINTER_MODE_DEVICE, &beta)) {
+        return CUBLAS_STATUS_INVALID_VALUE;
+    }
+    const auto dims = [](const LtLayout* l) {
+        return std::make_pair(static_cast<int>(l->rows), static_cast<int>(l->cols));
+    };
+    const float* A = Matrix<float>(a_p, dims(la).first, dims(la).second, static_cast<int>(la->ld));
+    const float* B = Matrix<float>(b_p, dims(lb).first, dims(lb).second, static_cast<int>(lb->ld));
+    const float* C = Matrix<float>(c_p, dims(lc).first, dims(lc).second, static_cast<int>(lc->ld));
+    float* D = Matrix<float>(d_p, dims(ld).first, dims(ld).second, static_cast<int>(ld->ld));
+    const bool has_bias = (desc->epilogue & CUBLASLT_EPILOGUE_BIAS) == CUBLASLT_EPILOGUE_BIAS;
+    const bool relu = (desc->epilogue & CUBLASLT_EPILOGUE_RELU) == CUBLASLT_EPILOGUE_RELU;
+    const float* bias = has_bias ? Device<float>(desc->bias, m) : nullptr;
+    if (!A || !B || !C || !D || (has_bias && !bias)) return CUBLAS_STATUS_INVALID_VALUE;
+    ++g.stats.blas_calls;
+    std::vector<float> result(m * n);  // C may alias D
+    for (uint64_t j = 0; j < n; ++j) {
+        for (uint64_t i = 0; i < m; ++i) {
+            double sum = 0;
+            for (uint64_t p = 0; p < k; ++p) {
+                const float av = at ? A[p + i * la->ld] : A[i + p * la->ld];
+                const float bv = bt ? B[j + p * lb->ld] : B[p + j * lb->ld];
+                sum += static_cast<double>(av) * bv;
+            }
+            float value = alpha * static_cast<float>(sum);
+            if (beta != 0) value += beta * C[i + j * lc->ld];
+            if (has_bias) value += bias[i];
+            if (relu) value = std::max(value, 0.0f);
+            result[i + j * m] = value;
+        }
+    }
+    for (uint64_t j = 0; j < n; ++j) {
+        for (uint64_t i = 0; i < m; ++i) D[i + j * ld->ld] = result[i + j * m];
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
 #endif  // TUNA_CUDA_HAVE_CUBLAS
 
 struct Entry {
@@ -796,6 +1037,19 @@ const Entry kEntries[] = {
     TUNA_MOCK("cublasGetMatrix", BlasGetMatrix),
     TUNA_MOCK("cublasSetMatrixAsync", BlasSetMatrixAsync),
     TUNA_MOCK("cublasGetMatrixAsync", BlasGetMatrixAsync),
+    TUNA_MOCK("cublasLtCreate", LtCreate),
+    TUNA_MOCK("cublasLtDestroy", LtDestroy),
+    TUNA_MOCK("cublasLtMatmulDescCreate", LtDescCreate),
+    TUNA_MOCK("cublasLtMatmulDescDestroy", LtDescDestroy),
+    TUNA_MOCK("cublasLtMatmulDescSetAttribute", LtDescSetAttribute),
+    TUNA_MOCK("cublasLtMatrixLayoutCreate", LtLayoutCreate),
+    TUNA_MOCK("cublasLtMatrixLayoutDestroy", LtLayoutDestroy),
+    TUNA_MOCK("cublasLtMatrixLayoutSetAttribute", LtLayoutSetAttribute),
+    TUNA_MOCK("cublasLtMatmulPreferenceCreate", LtPrefCreate),
+    TUNA_MOCK("cublasLtMatmulPreferenceDestroy", LtPrefDestroy),
+    TUNA_MOCK("cublasLtMatmulPreferenceSetAttribute", LtPrefSetAttribute),
+    TUNA_MOCK("cublasLtMatmulAlgoGetHeuristic", LtHeuristic),
+    TUNA_MOCK("cublasLtMatmul", LtMatmul),
 #endif
 };
 #undef TUNA_MOCK

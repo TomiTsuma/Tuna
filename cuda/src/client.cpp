@@ -11,20 +11,85 @@
 
 #include "tuna/cuda/client.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <vector>
 
+#include "cuda_api_ids.h"
 #include "tuna/cuda/bridge.h"
 #include "tuna/tunnel/client.h"
 
 namespace tuna::cudart {
 
 namespace {
+
+#include "cuda_coverage.inc"
+
+// TUNA_STATS=1: per-api counts of blocking and posted calls, and the time
+// blocking calls waited, printed at exit. Every blocking call costs a round
+// trip, so this is where a workload's remoting overhead comes from.
+struct ApiStats {
+    std::atomic<uint64_t> blocking{0};
+    std::atomic<uint64_t> posted{0};
+    std::atomic<uint64_t> wait_ns{0};
+};
+std::array<ApiStats, kLastCudaApi + 1> g_stats;
+
+bool StatsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TUNA_STATS");
+        return value && *value;
+    }();
+    return enabled;
+}
+
+void PrintStats() {
+    struct Row {
+        const char* name;
+        uint64_t blocking, posted, wait_ns;
+    };
+    std::vector<Row> rows;
+    uint64_t blocking = 0, posted = 0, wait_ns = 0;
+    for (const auto& entry : kCudaApiNames) {
+        const ApiStats& s = g_stats[entry.id];
+        Row row{entry.name, s.blocking.load(), s.posted.load(), s.wait_ns.load()};
+        if (row.blocking + row.posted == 0) continue;
+        blocking += row.blocking;
+        posted += row.posted;
+        wait_ns += row.wait_ns;
+        rows.push_back(row);
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.wait_ns > b.wait_ns; });
+    std::fprintf(stderr, "tuna: call statistics (blocking calls wait for a round trip; posted calls are batched)\n");
+    std::fprintf(stderr, "tuna:   %-44s %10s %10s %10s\n", "api", "blocking", "posted", "wait ms");
+    for (const Row& r : rows) {
+        std::fprintf(stderr, "tuna:   %-44s %10llu %10llu %10.1f\n", r.name, static_cast<unsigned long long>(r.blocking),
+                     static_cast<unsigned long long>(r.posted), r.wait_ns / 1e6);
+    }
+    std::fprintf(stderr, "tuna:   %-44s %10llu %10llu %10.1f\n", "total", static_cast<unsigned long long>(blocking),
+                 static_cast<unsigned long long>(posted), wait_ns / 1e6);
+}
+
+void CountCall(uint32_t api_id, bool posted, uint64_t wait_ns) {
+    if (api_id > kLastCudaApi) return;
+    static const bool registered = [] { return std::atexit(PrintStats) == 0; }();
+    (void)registered;
+    ApiStats& s = g_stats[api_id];
+    if (posted) {
+        ++s.posted;
+    } else {
+        ++s.blocking;
+        s.wait_ns += wait_ns;
+    }
+}
 
 std::atomic<CallHook> g_hook{nullptr};
 std::mutex g_hook_mutex;
@@ -168,7 +233,12 @@ Reply Call(uint32_t api_id, const ArgWriter& in, const std::string& bulk_in, boo
         reply.result = kErrNoDevice;
         return reply;
     }
+    const auto start = std::chrono::steady_clock::now();
     CallResult r = rpc->Call(api_id, in.str(), synchronizing, bulk_in);
+    if (StatsEnabled()) {
+        const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+        CountCall(api_id, /*posted=*/false, static_cast<uint64_t>(waited.count()));
+    }
     if (r.result == kResultTransportError) {
         reply.transport_error = true;
         return reply;
@@ -190,6 +260,7 @@ int32_t Post(uint32_t api_id, const ArgWriter& in, const std::string& bulk_in) {
     if (!rpc) return Fail(kErrNoDevice);
     if (!rpc->connected()) return Fail(kErrUnknown);
     rpc->Post(api_id, in.str(), bulk_in);
+    if (StatsEnabled()) CountCall(api_id, /*posted=*/true, 0);
     return 0;
 }
 
@@ -204,6 +275,30 @@ int32_t LastError(bool clear) {
     const int32_t error = t_last_error;
     if (clear) t_last_error = 0;
     return error;
+}
+
+int32_t ArrivedAsyncError(bool clear) {
+    if (g_hook.load()) {
+        std::lock_guard<std::mutex> lock(g_hook_mutex);
+        const int32_t error = g_hook_latched.value_or(0);
+        if (clear) g_hook_latched.reset();
+        return error;
+    }
+    RpcClient* rpc = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_session_mutex);
+        rpc = g_rpc;
+    }
+    if (!rpc) return 0;
+    return rpc->ArrivedAsyncError(clear).value_or(0);
+}
+
+bool LaunchBlocking() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("CUDA_LAUNCH_BLOCKING");
+        return value && *value && std::string(value) != "0";
+    }();
+    return enabled;
 }
 
 int Unsupported(const char* name) {

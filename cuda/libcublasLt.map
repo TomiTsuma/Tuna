@@ -1,0 +1,11 @@
+/* Linux version script for the replacement libcublasLt.so.12. The node name
+   matches NVIDIA's, so binaries linked against the real cuBLASLt (whose
+   imports are versioned "libcublasLt.so.12", as PyTorch's are) bind to the
+   shim. Everything else stays local. */
+libcublasLt.so.12 {
+  global:
+    cublasLt*;
+    tuna_cublaslt_shim;
+  local:
+    *;
+};

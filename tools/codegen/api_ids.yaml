@@ -110,3 +110,16 @@ cuDevicePrimaryCtxSetFlags_v2: 105
 cuDeviceTotalMem_v2: 106
 cuDriverGetVersion: 107
 cuInit: 108
+cublasLtCreate: 109
+cublasLtDestroy: 110
+cublasLtMatmul: 111
+cublasLtMatmulAlgoGetHeuristic: 112
+cublasLtMatmulDescCreate: 113
+cublasLtMatmulDescDestroy: 114
+cublasLtMatmulDescSetAttribute: 115
+cublasLtMatmulPreferenceCreate: 116
+cublasLtMatmulPreferenceDestroy: 117
+cublasLtMatmulPreferenceSetAttribute: 118
+cublasLtMatrixLayoutCreate: 119
+cublasLtMatrixLayoutDestroy: 120
+cublasLtMatrixLayoutSetAttribute: 121

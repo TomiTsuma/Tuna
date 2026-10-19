@@ -27,17 +27,13 @@
 #include <algorithm>
 
 #include "cuda_api_ids.h"
+#include "dispatch_internal.h"
 #include "tuna/tunnel/rpc.h"
 
 namespace tuna::cudart {
 
-namespace {
-
-constexpr int32_t kCudaErrorInvalidValue = 1;
-constexpr int32_t kCudaErrorNotSupported = 801;
-
-int32_t CublasAsyncError(cublasStatus_t status) {
-    switch (status) {
+int32_t CublasAsyncError(int status) {
+    switch (static_cast<cublasStatus_t>(status)) {
     case CUBLAS_STATUS_SUCCESS: return cudaSuccess;
     case CUBLAS_STATUS_NOT_INITIALIZED: return cudaErrorInitializationError;
     case CUBLAS_STATUS_ALLOC_FAILED: return cudaErrorMemoryAllocation;
@@ -49,6 +45,10 @@ int32_t CublasAsyncError(cublasStatus_t status) {
     default: return cudaErrorUnknown;  // INTERNAL_ERROR, LICENSE_ERROR
     }
 }
+
+namespace {
+
+constexpr int32_t kCudaErrorInvalidValue = 1;
 
 bool IsAsyncCublasCopy(uint32_t api_id) {
     return api_id == kApi_cublasSetMatrixAsync || api_id == kApi_cublasGetMatrixAsync;

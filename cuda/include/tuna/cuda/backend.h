@@ -65,6 +65,10 @@ private:
                         RpcResponse& resp);
     void MatrixCopy(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out, RpcResponse& resp);
     void CublasHandleCall(const RpcRequest& request, RpcResponse& resp);
+    // cuBLASLt calls (dispatch_cublaslt.cpp; false without the cuBLAS headers).
+    bool DispatchCublasLt(const RpcRequest& request, RpcResponse& resp);
+    // The real object behind a client's cuBLASLt id, if it is of `kind`.
+    void* LtObjectPtr(uint64_t id, int kind);
     // Driver API calls (dispatch_driver.cpp).
     bool DispatchDriver(const RpcRequest& request, RpcResponse& resp);
     // cuInit(0) in this worker, once; 0 or the CUresult that failed.
@@ -94,6 +98,19 @@ private:
     // cuBLAS handles this session created -> pointer mode is DEVICE. A handle
     // is a host pointer in this process, so no other value reaches cuBLAS.
     std::map<void*, bool> cublas_handles_;
+    // cuBLASLt: the descriptor objects, named by the client (see
+    // cublaslt_client.cpp); handles from cublasLtCreate; the algos the
+    // heuristic handed out (the only ones a matmul accepts).
+    enum LtKind { kLtMatmulDesc = 1, kLtLayout = 2, kLtPreference = 3 };
+    struct LtObject {
+        int kind;
+        void* ptr;
+        int32_t scale_type;    // matmul descriptors: cudaDataType of alpha/beta
+        int32_t pointer_mode;  // matmul descriptors: cublasLtPointerMode_t
+    };
+    std::map<uint64_t, LtObject> lt_objects_;
+    std::set<void*> lt_handles_;
+    std::set<std::string> lt_algos_;
     // Driver API state: whether cuInit succeeded, and the devices whose primary
     // context this session retained (kept until the worker exits).
     bool driver_initialized_ = false;

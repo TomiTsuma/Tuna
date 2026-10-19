@@ -111,7 +111,20 @@ enum TunaCudaApi : uint32_t {
     kApi_cuDeviceTotalMem_v2 = 106,
     kApi_cuDriverGetVersion = 107,
     kApi_cuInit = 108,
+    kApi_cublasLtCreate = 109,
+    kApi_cublasLtDestroy = 110,
+    kApi_cublasLtMatmul = 111,
+    kApi_cublasLtMatmulAlgoGetHeuristic = 112,
+    kApi_cublasLtMatmulDescCreate = 113,
+    kApi_cublasLtMatmulDescDestroy = 114,
+    kApi_cublasLtMatmulDescSetAttribute = 115,
+    kApi_cublasLtMatmulPreferenceCreate = 116,
+    kApi_cublasLtMatmulPreferenceDestroy = 117,
+    kApi_cublasLtMatmulPreferenceSetAttribute = 118,
+    kApi_cublasLtMatrixLayoutCreate = 119,
+    kApi_cublasLtMatrixLayoutDestroy = 120,
+    kApi_cublasLtMatrixLayoutSetAttribute = 121,
 };
 constexpr uint32_t kFirstCudaApi = 1;
-constexpr uint32_t kLastCudaApi = 108;
+constexpr uint32_t kLastCudaApi = 121;
 }  // namespace tuna::cudart

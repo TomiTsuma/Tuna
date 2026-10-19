@@ -59,6 +59,7 @@ RpcResponse CudaSession::Dispatch(const RpcRequest& request, const std::string& 
     try {
         if (DispatchSpecial(request, bulk_in, bulk_out, resp)) return resp;
         if (DispatchCublas(request, bulk_in, bulk_out, resp)) return resp;
+        if (DispatchCublasLt(request, resp)) return resp;
         if (DispatchDriver(request, resp)) return resp;
 #include "cuda_server_dispatch.inc"
     } catch (const std::exception&) {
@@ -74,6 +75,8 @@ RpcResponse CudaSession::Dispatch(const RpcRequest& request, const std::string& 
 bool CudaSession::DispatchCublas(const RpcRequest&, const std::string&, std::string*, RpcResponse&) { return false; }
 void CudaSession::MatrixCopy(const RpcRequest&, const std::string&, std::string*, RpcResponse&) {}
 void CudaSession::CublasHandleCall(const RpcRequest&, RpcResponse&) {}
+bool CudaSession::DispatchCublasLt(const RpcRequest&, RpcResponse&) { return false; }
+void* CudaSession::LtObjectPtr(uint64_t, int) { return nullptr; }
 #endif
 
 bool CudaSession::DispatchSpecial(const RpcRequest& request, const std::string& bulk_in, std::string* bulk_out,

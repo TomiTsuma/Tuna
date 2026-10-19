@@ -21,19 +21,24 @@ This is option **B2** (Linux client first) from
 Since Phase 3d the shim set also replaces **cuBLAS** (`libcublas.so.12` /
 `cublas64_12.dll`): see [cuBLAS](#cublas-phase-3d) below. Since Phase 3e it
 also replaces the **driver library** (`libcuda.so.1` / `nvcuda.dll`): see
-[Driver API](#driver-api-phase-3e). With the three, an unmodified PyTorch on
-a client with no NVIDIA GPU sees the server's GPU (plan milestone 4).
+[Driver API](#driver-api-phase-3e). Since Phase 3f it also replaces
+**cuBLASLt** (`libcublasLt.so.12` / `cublasLt64_12.dll`): see
+[cuBLASLt](#cublaslt-phase-3f). With these four shims, an unmodified PyTorch
+on a client with no NVIDIA GPU sees the server's GPU (plan milestone 4).
+It also trains a model there, with bit-identical results (milestone 5, MLP).
 
 ## What crosses the wire
 
 | Application does | Shim | Server |
 |---|---|---|
 | a simple runtime call (`cudaMalloc`, `cudaStreamCreate`, ...) | generated stub: flat little-endian args, one round trip | generated `case`: decode → real call → encode outs |
-| `cudaLaunchKernel` / `kernel<<<>>>` | **fire-and-forget**, batched; params packed by value | `cuLaunchKernel` with the layout from `cuFuncGetParamInfo` |
+| `cudaLaunchKernel` / `kernel<<<>>>` | configuration checked locally (device limits), then **fire-and-forget**, batched; params packed by value | `cuLaunchKernel` with the layout from `cuFuncGetParamInfo` |
 | first launch of a kernel from a fatbin | uploads the fatbin nvcc embedded (once per session), fetches the kernel's param layout (once) | `cuModuleLoadData` per CUDA context, `cuModuleGetFunction` |
 | `cudaMemcpy` H2D / D2H | payload on the **bulk channel** (separate socket, 1 MiB chunks) | real `cudaMemcpy` from/into the payload |
 | `cudaMemcpyAsync` H2D / D2D, `cudaMemsetAsync`, `cudaEventRecord`, `cudaStreamWaitEvent` | fire-and-forget | real async call |
-| `cudaDeviceSynchronize`, `cudaStreamSynchronize`, `cudaEventSynchronize`, `cudaMemcpy`, `cudaGetLastError` | synchronizing: reports a failed fire-and-forget call, as CUDA reports async errors | |
+| `cudaDeviceSynchronize`, `cudaStreamSynchronize`, `cudaEventSynchronize`, `cudaMemcpy` | synchronizing: reports a failed fire-and-forget call, as CUDA reports async errors | |
+| `cudaGetLastError` / `cudaPeekAtLastError` | **local**: the thread's own error, or a fire-and-forget failure whose answer already arrived (with `CUDA_LAUNCH_BLOCKING=1`: asks the server, which flushes) | |
+| `cudaGetDevice`, `cudaStreamIsCapturing` | **local** after the first answer (the device changes only through `cudaSetDevice`; graph capture is unsupported) | |
 | `cudaMemcpyToSymbol` / `__constant__` / `__device__` vars | resolves the symbol's device address once per context | `cuModuleGetGlobal` |
 | `cudaMallocHost`, `cudaHostRegister`, error strings, `cudaRuntimeGetVersion` | **local**, no round trip | |
 | device properties / attributes | fetched once, then cached | |
@@ -91,6 +96,55 @@ back-to-back 1024² SGEMMs run at **5658 GFlop/s natively, 5647 through Tuna
 (plaintext) and 5493 (mTLS)**, with bit-identical results: posted calls keep
 the GPU fed.
 
+## cuBLASLt (Phase 3f)
+
+PyTorch's `nn.Linear` with a bias (`addmm`) runs as one cuBLASLt matmul
+with a bias epilogue. NVIDIA's libcublasLt cannot run on a GPU-less client
+either, so `libcublasLt.so.12` (Tuna's) exports its full ABI (177 symbols,
+version node `libcublasLt.so.12`) and remotes the 13 calls PyTorch makes:
+handle create/destroy; create, set-attribute and destroy for matmul
+descriptors, matrix layouts and preferences; the heuristic query; and the
+matmul.
+
+- **The client names the descriptor objects.** PyTorch builds and destroys a
+  matmul descriptor, three layouts and a preference for *every* GEMM, about 15
+  calls. The shim allocates each object's id itself, so create, set-attribute,
+  destroy and the matmul are all fire-and-forget. A GEMM costs **one round
+  trip** (the heuristic query) instead of ~15. The server maps ids to the real
+  objects, checks each id is of the expected kind, and refuses unknown ids.
+  A failed create therefore surfaces at the next call that uses the object.
+- **Handles:** PyTorch passes its cuBLAS handle as the Lt handle, which NVIDIA
+  allows. The server accepts the cuBLAS handles it created and handles from
+  `cublasLtCreate`, and nothing else.
+- **Algos are allowlisted.** `cublasLtMatmulAlgo_t` is an opaque blob that
+  cuBLASLt interprets, so a matmul only accepts an algo the heuristic returned
+  in this session (or none).
+- **Scalars:** alpha/beta follow the descriptor's pointer mode and scale type.
+  Both client and server track these from `cublasLtMatmulDescSetAttribute`,
+  and the server refuses a scalar encoded the other way.
+- Attribute values are capped at 256 bytes and copied at the exact size sent.
+  Version, property and status-string queries are local. Everything else is
+  `CUBLAS_STATUS_NOT_SUPPORTED`.
+
+## Performance: what a workload pays
+
+`TUNA_STATS=1` prints, at exit, how many calls of each API were blocking
+(one round trip each) or posted (batched), and how long the blocking ones
+waited. Profiling the MLP training sample with it showed where the time went.
+The fixes make the client answer exactly what it already knows:
+
+| per 200 training steps (loopback, RTX 4050) | before | after |
+|---|---|---|
+| `cudaGetDevice` (PyTorch asks ~280× per step) | 56,735 round trips | 1 (cached) |
+| `cudaGetLastError` (after every kernel launch) | 4,026 round trips | 0 (local) |
+| `cudaStreamIsCapturing` | 207 round trips | 0 (graph capture is unsupported) |
+| all blocking calls | 61,659 | 692 |
+| ms/step over 200 steps, incl. first-launch warm-up (native: 4.05) | 31.1 | 8.2 |
+| ms/step over 400 steps, 3 runs (native: 2.0 – 2.6) | | **2.8 – 3.6** |
+
+What remains per step is one heuristic query per `nn.Linear` forward GEMM.
+Caching heuristic results by descriptor contents is the next Phase 4 step.
+
 ## Driver API (Phase 3e)
 
 Programs rarely call the driver API, but frameworks and NVIDIA's libraries
@@ -136,6 +190,7 @@ a GPU, that library must be Tuna's too.
 | `include/tuna/cuda/bridge.h` | `tuna_cudart_call`: the C bridge library shims send through |
 | `include/tuna/cuda/cublas_client.h` | cuBLAS shim plumbing (call/post, status mapping, scalar refs) |
 | `include/tuna/cuda/driver_client.h` | driver shim plumbing (call, CUresult codes) |
+| `include/tuna/cuda/cublaslt_client.h` | cuBLASLt shim limits (attribute size, heuristic results) |
 | `src/client.cpp` | session (lazy connect from env), call/post, last error |
 | `src/client_runtime.cpp` | memcpy family, host memory, caches, error strings |
 | `src/client_launch.cpp` | fatbin/kernel/variable registration, launch, symbols |
@@ -144,15 +199,17 @@ a GPU, that library must be Tuna's too.
 | `src/cublas_unsupported.cpp` | the generated not-supported cuBLAS exports |
 | `src/driver_client.cpp` | driver shim: context tokens, cached device queries, error strings, `cuGetProcAddress` |
 | `src/driver_unsupported.cpp` | the generated not-supported driver exports |
+| `src/cublaslt_client.cpp`, `src/cublaslt_unsupported.cpp` | cuBLASLt shim: client-named descriptor objects, scalars by pointer mode; the not-supported exports |
 | `src/dispatch.cpp` | server: `CudaSession::Dispatch` (generated switch + hand-written calls) |
 | `src/dispatch_cublas.cpp` | server: cuBLAS (generated switch + matrix copies, async status mapping) |
 | `src/dispatch_driver.cpp` | server: driver API (generated switch + primary-context retain, device name) |
+| `src/dispatch_cublaslt.cpp` | server: cuBLASLt (object table, handle/kind/algo/scalar checks) |
 | `src/backend_real.cpp` | `dlopen` of NVIDIA's libcudart + libcuda (+ libcublas on first use); refuses to load Tuna's shims |
-| `libcudart.map`, `libcublas.map`, `libcuda.map` | Linux version scripts (export only the CUDA / cuBLAS / driver API) |
+| `libcudart.map`, `libcublas.map`, `libcublasLt.map`, `libcuda.map` | Linux version scripts (export only each library's API) |
 | `generated/` | committed codegen output (CI checks it is current) |
 | `samples/*.cu` | real-GPU milestone programs (deviceQuery, vectorAdd, matrixMul, symbols/streams, cuBLAS sgemm) |
 | `samples/torch_*.py` | PyTorch milestone programs (4: matmul; 5: a training loop) |
-| `tests/test_marshal.cpp`, `tests/test_cublas.cpp`, `tests/test_driver.cpp` | GPU-free round trips through `CudaSession` + the mock |
+| `tests/test_marshal.cpp`, `tests/test_cublas.cpp`, `tests/test_cublaslt.cpp`, `tests/test_driver.cpp` | GPU-free round trips through `CudaSession` + the mock |
 | `tests/mock_cuda.cpp` | mock CUDA stack: device memory in host buffers, three kernels, one `__constant__`, a small cuBLAS |
 | `tests/e2e_client.cpp`, `tests/e2e_cublas_client.cpp`, `tests/e2e_driver_client.cpp` + `tests/integration/test_cuda_e2e.py` | real binaries end to end (TCP and mTLS), mock instead of a GPU |
 | `tests/integration/test_gpu_samples.py` | nvcc-built samples natively and through Tuna on a real GPU |
@@ -208,7 +265,7 @@ export TUNA_CA_CERT=ca.crt TUNA_CLIENT_CERT=alice.crt TUNA_CLIENT_KEY=alice.key 
 LD_LIBRARY_PATH=/path/to/build/shim ./my_cuda_app
 # Libraries that find CUDA through RPATH (PyTorch's) ignore LD_LIBRARY_PATH:
 S=/path/to/build/shim
-LD_PRELOAD=$S/libcudart.so.12:$S/libcublas.so.12:$S/libcuda.so.1 python train.py
+LD_PRELOAD=$S/libcudart.so.12:$S/libcublas.so.12:$S/libcublasLt.so.12:$S/libcuda.so.1 python train.py
 ```
 
 On Windows, put the shim DLLs **next to the application's .exe**. Windows
@@ -218,7 +275,9 @@ with an NVIDIA driver only the application's own directory wins. Phase 5's
 
 Variables: `TUNA_SERVER` (required), `TUNA_CA_CERT` / `TUNA_CLIENT_CERT` /
 `TUNA_CLIENT_KEY` (all or none; none only works against a loopback server),
-`TUNA_SERVER_NAME`, `TUNA_CONNECT_TIMEOUT_MS`, `TUNA_LOG=1`. Without a
+`TUNA_SERVER_NAME`, `TUNA_CONNECT_TIMEOUT_MS`, `TUNA_LOG=1`, `TUNA_STATS=1`
+(per-API call statistics at exit), `CUDA_LAUNCH_BLOCKING=1` (error queries
+wait for every queued call). Without a
 reachable server every call returns `cudaErrorNoDevice`, which applications
 already handle as "no GPU".
 
@@ -233,14 +292,21 @@ already handle as "no GPU".
 - All client threads share one server thread (one CUDA "current device"),
   which is correct for single-device programs; per-thread device state is
   future work.
-- A failed launch is reported by the next synchronizing call rather than by
-  `cudaLaunchKernel` itself; a launch-configuration error is therefore also
-  returned by e.g. `cudaDeviceSynchronize`, where CUDA would only return it
-  from the launch or `cudaGetLastError`.
+- A launch with a bad configuration (block or grid dimensions beyond the
+  device's limits) fails in `cudaLaunchKernel` itself, as in CUDA: the client
+  checks it against the cached device properties. Any other launch failure
+  (too much shared memory, a bad kernel argument) is reported by the next
+  synchronizing call. `cudaGetLastError` right after the launch sees such a
+  failure only if the server's answer has already arrived; set
+  `CUDA_LAUNCH_BLOCKING=1` to have it wait.
 - Libraries that bundle their own GPU code paths without going through
-  libcudart need their own API shims. cuBLAS has one (Phase 3d); cuBLASLt,
-  cuDNN, cuFFT, cuRAND, cuSPARSE and NCCL do not yet. PyTorch needs several:
-  `nn.Linear` with a bias goes through cuBLASLt, convolutions through cuDNN.
+  libcudart need their own API shims. cuBLAS (3d) and cuBLASLt (3f) have one.
+  cuDNN, cuFFT, cuRAND, cuSPARSE and NCCL do not yet; PyTorch's convolutions
+  need cuDNN.
+- cuBLASLt: the calls PyTorch's GEMMs make are remoted; descriptor queries
+  (`...GetAttribute`), `cublasLtMatmulAlgoInit` and the matrix transforms are
+  not yet. A posted call's failure (a bad attribute, a refused algo) is
+  reported by the next synchronizing CUDA call, as with cuBLAS.
 - Driver API: primary contexts only (`cuCtxCreate` is not supported). Modules
   loaded through the driver (`cuModuleLoadData`, which PyTorch's JIT
   "jiterator" kernels use) are not supported yet. `cuGetProcAddress` ignores

@@ -51,6 +51,15 @@ int32_t Fail(int32_t error);
 // The client's own last error for this thread. `clear` resets it.
 int32_t LastError(bool clear);
 
+// The failure of an earlier fire-and-forget call, if the server's answer has
+// already arrived (no round trip); 0 if none. `clear` resets it.
+int32_t ArrivedAsyncError(bool clear);
+
+// True when CUDA_LAUNCH_BLOCKING is set: error queries then wait for every
+// queued call, so a failed launch is reported by the next cudaGetLastError
+// (CUDA's own debugging switch for asynchronous errors).
+bool LaunchBlocking();
+
 // Generated stubs for libcudart exports Tuna does not remote. Logs the name
 // once (with TUNA_LOG=1) and returns cudaErrorNotSupported.
 int Unsupported(const char* name);
@@ -71,6 +80,8 @@ void BumpContextGeneration();
 //   TUNA_SERVER_NAME  identity to verify (default: the host)
 //   TUNA_CONNECT_TIMEOUT_MS  retry window for the first connect (default 5000)
 //   TUNA_LOG=1        diagnostics on stderr
+//   TUNA_STATS=1      at exit, per-api counts of blocking and posted calls and
+//                     the time blocking calls waited (what remoting costs)
 // Without a reachable server every call fails with cudaErrorNoDevice, which
 // applications already treat as "no CUDA GPU here".
 bool Connect(std::string* error);

@@ -44,9 +44,11 @@ public:
 
 MockBackend g_backend;
 std::unique_ptr<CudaSession> g_session;
+uint64_t g_round_trips = 0;  // blocking calls that reached the "server"
 
 // In-process stand-in for the transport: run the session's dispatcher directly.
-Reply InProcessCall(uint32_t api_id, const std::string& args, const std::string& bulk_in, bool) {
+Reply InProcessCall(uint32_t api_id, const std::string& args, const std::string& bulk_in, bool async) {
+    if (!async) ++g_round_trips;
     RpcRequest request;
     request.set_api_id(api_id);
     request.set_args(args);
@@ -287,11 +289,61 @@ TEST_CASE_METHOD(Fixture, "A failed async launch surfaces on the next synchroniz
     REQUIRE(cudaMalloc(&d, 16) == cudaSuccess);
     int value = 1, n = 4;
     void* args[] = {&d, &value, &n};
-    // 2048 threads per block is invalid; the launch itself is fire-and-forget.
-    REQUIRE(cudaLaunchKernel(&g_fill_stub, dim3(1), dim3(2048), args, 0, nullptr) == cudaSuccess);
+    // Too much dynamic shared memory fails on the device side; the launch
+    // itself is fire-and-forget.
+    REQUIRE(cudaLaunchKernel(&g_fill_stub, dim3(1), dim3(4), args, 1 << 20, nullptr) == cudaSuccess);
     CHECK(cudaDeviceSynchronize() == cudaErrorInvalidValue);
     CHECK(cudaGetLastError() == cudaErrorInvalidValue);  // recorded as the last error...
     CHECK(cudaGetLastError() == cudaSuccess);             // ...and cleared by reading it
+}
+
+// PyTorch asks for the current device hundreds of times per training step and
+// checks the last error after every launch; neither may cost a round trip.
+TEST_CASE_METHOD(Fixture, "Device and error queries per op are answered without a round trip", "[cuda][launch]") {
+    RegisterProgram();
+    void* d = nullptr;
+    REQUIRE(cudaMalloc(&d, 16) == cudaSuccess);
+    int device = -1;
+    REQUIRE(cudaGetDevice(&device) == cudaSuccess);  // the first answer comes from the server
+    CHECK(device == 0);
+
+    int value = 1, n = 4;
+    void* args[] = {&d, &value, &n};
+    // The first launch uploads the module and fetches the kernel's layout.
+    REQUIRE(cudaLaunchKernel(&g_fill_stub, dim3(1), dim3(4), args, 0, nullptr) == cudaSuccess);
+    const uint64_t before = g_round_trips;
+    for (int i = 0; i < 100; ++i) {
+        REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+        REQUIRE(cudaLaunchKernel(&g_fill_stub, dim3(1), dim3(4), args, 0, nullptr) == cudaSuccess);
+        REQUIRE(cudaGetLastError() == cudaSuccess);
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusActive;
+        REQUIRE(cudaStreamIsCapturing(nullptr, &capture) == cudaSuccess);
+        REQUIRE(capture == cudaStreamCaptureStatusNone);
+    }
+    CHECK(g_round_trips == before);
+
+    // cudaSetDevice keeps the cached device current.
+    REQUIRE(cudaSetDevice(1) == cudaSuccess);
+    REQUIRE(cudaGetDevice(&device) == cudaSuccess);
+    CHECK(device == 1);
+
+    // A bad configuration is caught by the launch itself, as in CUDA...
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    const uint64_t at_config = g_round_trips;
+    CHECK(cudaLaunchKernel(&g_fill_stub, dim3(1), dim3(2048), args, 0, nullptr) == cudaErrorInvalidConfiguration);
+    CHECK(cudaLaunchKernel(&g_fill_stub, dim3(0), dim3(4), args, 0, nullptr) == cudaErrorInvalidConfiguration);
+    CHECK(cudaGetLastError() == cudaErrorInvalidConfiguration);
+    CHECK(g_round_trips == at_config);
+    CHECK(MockCudaGetStats().launches == 101);  // neither reached the server
+
+    // ...and a device-side failure whose answer has arrived is reported, still locally.
+    REQUIRE(cudaLaunchKernel(&g_fill_stub, dim3(1), dim3(4), args, 1 << 20, nullptr) == cudaSuccess);
+    const uint64_t at_launch = g_round_trips;
+    CHECK(cudaPeekAtLastError() == cudaErrorInvalidValue);
+    CHECK(cudaGetLastError() == cudaErrorInvalidValue);
+    CHECK(cudaGetLastError() == cudaSuccess);
+    CHECK(g_round_trips == at_launch);
+    CHECK(cudaDeviceSynchronize() == cudaSuccess);  // reported once, not again
 }
 
 TEST_CASE_METHOD(Fixture, "Unknown kernels are rejected", "[cuda][launch]") {

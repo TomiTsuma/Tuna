@@ -269,6 +269,10 @@ TUNA_CUDART_EXPORT cudaError_t __cudaPopCallConfiguration(dim3* gridDim, dim3* b
 // pointers among them are server addresses already, so they pass unchanged.
 TUNA_CUDART_EXPORT cudaError_t cudaLaunchKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
                                                 size_t sharedMem, cudaStream_t stream) {
+    // A bad configuration is reported by the launch itself, as CUDA does.
+    if (int32_t e = ValidateLaunch(gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z)) {
+        return static_cast<cudaError_t>(Fail(e));
+    }
     ArgWriter in;
     {
         std::lock_guard<std::mutex> lock(g_mutex);

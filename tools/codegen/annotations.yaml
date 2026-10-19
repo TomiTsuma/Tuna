@@ -24,7 +24,8 @@
 functions:
   # --- device management
   cudaGetDeviceCount: {count: out_scalar}
-  cudaGetDevice: {device: out_scalar}
+  # Cached by the client after the first answer (cudaSetDevice keeps it current).
+  cudaGetDevice: {_wrap: true, device: out_scalar}
   cudaSetDevice: {_wrap: true, device: in_scalar}
   cudaDeviceSynchronize: {_sync: true}
   # CUDA 12 redirects cudaGetDeviceProperties -> _v2 via a macro, so the real
@@ -62,8 +63,6 @@ functions:
   cudaStreamWaitEvent: {_async: true, stream: in_handle, event: in_handle, flags: in_scalar}
   cudaStreamGetPriority: {hStream: in_handle, priority: out_scalar}
   cudaStreamGetFlags: {hStream: in_handle, flags: out_scalar}
-  # Graph capture is not supported, so the server always answers "not capturing".
-  cudaStreamIsCapturing: {stream: in_handle, pCaptureStatus: out_scalar}
 
   # --- events
   cudaEventCreate: {event: out_handle}
@@ -105,6 +104,9 @@ local:
   - cudaHostGetFlags
   - cudaProfilerStart
   - cudaProfilerStop
+  # Graph capture is not supported (cudaStreamBeginCapture reports so), so no
+  # stream is ever capturing; PyTorch asks before allocator work.
+  - cudaStreamIsCapturing
   # kernel registration + launch (cuda/src/client_launch.cpp)
   - __cudaRegisterFatBinary
   - __cudaRegisterFatBinaryEnd

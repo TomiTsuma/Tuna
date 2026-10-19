@@ -12,6 +12,8 @@
 #                           are found: <build>/shim/libcublas.so.12 or
 #                           <build>/shim/cublas64_12.dll; it sends its calls
 #                           through tuna_cudart's session
+#   tuna_cublaslt           the cuBLASLt shim (Phase 3f), with tuna_cublas:
+#                           <build>/shim/libcublasLt.so.12 or cublasLt64_12.dll
 #   tuna_cuda_driver        the CUDA driver shim (Phase 3e): <build>/shim/libcuda.so.1
 #                           or <build>/shim/nvcuda.dll; also through tuna_cudart
 #   tuna_mock_cuda          a mock CUDA stack the server can load (tests)
@@ -81,7 +83,8 @@ set(_tuna_cuda_gen_names
     driver_client_stubs.inc driver_server_dispatch.inc driver_unsupported_stubs.inc driver_error_strings.inc)
 set(_tuna_codegen_cublas_args)
 if(TUNA_CUDA_HAVE_CUBLAS)
-    list(APPEND _tuna_cuda_gen_names cublas_client_stubs.inc cublas_server_dispatch.inc cublas_unsupported_stubs.inc)
+    list(APPEND _tuna_cuda_gen_names cublas_client_stubs.inc cublas_server_dispatch.inc cublas_unsupported_stubs.inc
+         cublaslt_unsupported_stubs.inc)
     set(_tuna_codegen_cublas_args --cublas "${TUNA_CUBLAS_INCLUDE_DIR}")
 endif()
 if(TUNA_REGEN_CUDA)
@@ -97,7 +100,8 @@ if(TUNA_REGEN_CUDA)
         DEPENDS "${TUNA_CODEGEN_DIR}/gen_cuda.py" "${TUNA_CODEGEN_DIR}/annotations.yaml"
                 "${TUNA_CODEGEN_DIR}/cudart12_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_cublas.yaml"
                 "${TUNA_CODEGEN_DIR}/cublas12_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_driver.yaml"
-                "${TUNA_CODEGEN_DIR}/cuda12_driver_exports.txt"
+                "${TUNA_CODEGEN_DIR}/cuda12_driver_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_cublaslt.yaml"
+                "${TUNA_CODEGEN_DIR}/cublasLt12_exports.txt"
         COMMENT "Generating CUDA runtime remoting stubs"
         VERBATIM)
     add_custom_target(tuna_cuda_codegen DEPENDS ${TUNA_CUDA_GENERATED})
@@ -115,7 +119,8 @@ set(_tuna_cuda_warnings $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 # Server-side dispatcher.
 add_library(tuna_cuda_dispatch STATIC ${TUNA_CUDA_DIR}/src/dispatch.cpp ${TUNA_CUDA_DIR}/src/dispatch_driver.cpp)
 if(TUNA_CUDA_HAVE_CUBLAS)
-    target_sources(tuna_cuda_dispatch PRIVATE ${TUNA_CUDA_DIR}/src/dispatch_cublas.cpp)
+    target_sources(tuna_cuda_dispatch PRIVATE ${TUNA_CUDA_DIR}/src/dispatch_cublas.cpp
+                   ${TUNA_CUDA_DIR}/src/dispatch_cublaslt.cpp)
     target_compile_definitions(tuna_cuda_dispatch PUBLIC TUNA_CUDA_HAVE_CUBLAS)
 endif()
 add_dependencies(tuna_cuda_dispatch tuna_cuda_codegen)
@@ -187,6 +192,29 @@ if(TUNA_CUDA_HAVE_CUBLAS)
             "LINKER:--version-script=${TUNA_CUDA_DIR}/libcublas.map" "LINKER:--no-undefined")
         set_property(TARGET tuna_cublas APPEND PROPERTY LINK_DEPENDS "${TUNA_CUDA_DIR}/libcublas.map")
     endif()
+
+    # The cuBLASLt shim: libcublasLt.so.12 / cublasLt64_12.dll (PyTorch's
+    # nn.Linear with a bias runs as one cuBLASLt matmul). Same session bridge.
+    add_library(tuna_cublaslt_client OBJECT
+        ${TUNA_CUDA_DIR}/src/cublaslt_client.cpp
+        ${TUNA_CUDA_DIR}/src/cublaslt_unsupported.cpp)
+    add_dependencies(tuna_cublaslt_client tuna_cuda_codegen)
+    target_include_directories(tuna_cublaslt_client PUBLIC ${_tuna_cuda_includes})
+    target_compile_options(tuna_cublaslt_client PRIVATE ${_tuna_cuda_warnings})
+
+    add_library(tuna_cublaslt SHARED $<TARGET_OBJECTS:tuna_cublaslt_client>)
+    target_link_libraries(tuna_cublaslt PRIVATE tuna_cudart)
+    set_target_properties(tuna_cublaslt PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shim"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shim")
+    if(WIN32)
+        set_target_properties(tuna_cublaslt PROPERTIES OUTPUT_NAME cublasLt64_12 PREFIX "")
+    else()
+        set_target_properties(tuna_cublaslt PROPERTIES OUTPUT_NAME cublasLt VERSION 12 SOVERSION 12)
+        target_link_options(tuna_cublaslt PRIVATE
+            "LINKER:--version-script=${TUNA_CUDA_DIR}/libcublasLt.map" "LINKER:--no-undefined")
+        set_property(TARGET tuna_cublaslt APPEND PROPERTY LINK_DEPENDS "${TUNA_CUDA_DIR}/libcublasLt.map")
+    endif()
 endif()
 
 # The driver shim: libcuda.so.1 / nvcuda.dll next to the runtime shim, for
@@ -248,7 +276,8 @@ function(tuna_add_cuda_tests)
         # The cuBLAS shim's objects in the same process: tuna_cudart_call is
         # then the in-process runtime client, so the whole chain is exercised.
         target_sources(tuna_cuda_tests PRIVATE ${TUNA_CUDA_DIR}/tests/test_cublas.cpp
-                       $<TARGET_OBJECTS:tuna_cublas_client>)
+                       ${TUNA_CUDA_DIR}/tests/test_cublaslt.cpp
+                       $<TARGET_OBJECTS:tuna_cublas_client> $<TARGET_OBJECTS:tuna_cublaslt_client>)
     endif()
     catch_discover_tests(tuna_cuda_tests TEST_PREFIX "cuda: ")
 
@@ -278,7 +307,7 @@ function(tuna_add_cuda_tests)
     if(TUNA_CUDA_HAVE_CUBLAS)
         add_executable(tuna_cublas_e2e_client ${TUNA_CUDA_DIR}/tests/e2e_cublas_client.cpp)
         target_include_directories(tuna_cublas_e2e_client PRIVATE ${TUNA_CUDA_INCLUDE_DIR} ${TUNA_CUBLAS_INCLUDE_DIR})
-        target_link_libraries(tuna_cublas_e2e_client PRIVATE tuna_cublas tuna_cudart)
+        target_link_libraries(tuna_cublas_e2e_client PRIVATE tuna_cublas tuna_cublaslt tuna_cudart)
         set(_tuna_cublas_e2e_args --cublas-client "$<TARGET_FILE:tuna_cublas_e2e_client>")
     endif()
 

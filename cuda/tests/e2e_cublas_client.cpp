@@ -6,6 +6,7 @@
 //   e2e_cublas_client                     the checks below, against $TUNA_SERVER
 //   e2e_cublas_client --expect-no-server  cuBLAS reports "not initialized"
 
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
 
@@ -101,6 +102,52 @@ int main(int argc, char** argv) {
     Ok(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &alpha, dA, 1, dB, n, &beta, dC, n), "bad sgemm (queued)");
     const cudaError_t sync = cudaDeviceSynchronize();
     Check(sync == cudaErrorInvalidValue, std::string("bad sgemm reported at sync: ") + cudaGetErrorName(sync));
+
+    // The same product through cuBLASLt (libcublasLt = Tuna's shim), the way
+    // PyTorch's addmm runs it: the cuBLAS handle as the Lt handle, a bias
+    // epilogue, a heuristic query, then the matmul.
+    {
+        auto lt = reinterpret_cast<cublasLtHandle_t>(handle);
+        std::vector<float> bias(n), D(n * n, 0.0f);
+        for (int i = 0; i < n; ++i) bias[i] = static_cast<float>(i % 5) - 2.0f;
+        float *dBias = nullptr, *dD = nullptr;
+        Ok(cudaMalloc(reinterpret_cast<void**>(&dBias), n * sizeof(float)), "cudaMalloc bias");
+        Ok(cudaMalloc(reinterpret_cast<void**>(&dD), n * n * sizeof(float)), "cudaMalloc D");
+        Ok(cudaMemcpy(dBias, bias.data(), n * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy bias");
+        cublasLtMatmulDesc_t desc = nullptr;
+        Ok(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F), "cublasLtMatmulDescCreate");
+        const int32_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        Ok(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)),
+           "set epilogue");
+        Ok(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &dBias, sizeof(dBias)),
+           "set bias pointer");
+        cublasLtMatrixLayout_t layout = nullptr;
+        Ok(cublasLtMatrixLayoutCreate(&layout, CUDA_R_32F, n, n, n), "cublasLtMatrixLayoutCreate");
+        cublasLtMatmulPreference_t pref = nullptr;
+        Ok(cublasLtMatmulPreferenceCreate(&pref), "cublasLtMatmulPreferenceCreate");
+        cublasLtMatmulHeuristicResult_t result{};
+        int count = 0;
+        Ok(cublasLtMatmulAlgoGetHeuristic(lt, desc, layout, layout, layout, layout, pref, 1, &result, &count),
+           "cublasLtMatmulAlgoGetHeuristic");
+        Check(count == 1, "the heuristic returns an algo");
+        Ok(cublasLtMatmul(lt, desc, &alpha, dA, layout, dB, layout, &beta, dD, layout, dD, layout, &result.algo,
+                          nullptr, 0, nullptr),
+           "cublasLtMatmul");
+        Ok(cudaMemcpy(D.data(), dD, n * n * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy D");
+        bool lt_correct = true;
+        for (int j = 0; j < n && lt_correct; ++j) {
+            for (int i = 0; i < n && lt_correct; ++i) {
+                const float want = ref[i + j * n] + bias[i];
+                lt_correct = std::fabs(D[i + j * n] - want) < 1e-3f * (1.0f + std::fabs(want));
+            }
+        }
+        Check(lt_correct, "cuBLASLt matmul + bias epilogue over the network matches the CPU reference");
+        cublasLtMatrixLayoutDestroy(layout);
+        cublasLtMatmulPreferenceDestroy(pref);
+        cublasLtMatmulDescDestroy(desc);
+        cudaFree(dBias);
+        cudaFree(dD);
+    }
 
     // A 24 MiB matrix (3072 x 2048 floats) rides the bulk channel both ways.
     const int rows = 3072, cols = 2048;

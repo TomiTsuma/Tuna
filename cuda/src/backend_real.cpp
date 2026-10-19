@@ -1,6 +1,6 @@
 // The production CudaBackend: resolves runtime symbols from the real
-// libcudart, driver symbols from libcuda and cuBLAS symbols from libcublas
-// (opened on first use). The server opens it inside the per-session worker,
+// libcudart, driver symbols from libcuda and cuBLAS / cuBLASLt symbols from
+// libcublas / libcublasLt (opened on first use). The server opens it inside the per-session worker,
 // so each session has its own CUDA context (Phase 2c isolates the process).
 
 #include "tuna/cuda/backend_real.h"
@@ -26,6 +26,7 @@ namespace {
 constexpr const char* kDefaultRuntime = "cudart64_12.dll";
 constexpr const char* kDefaultDriver = "nvcuda.dll";
 constexpr const char* kDefaultCublas = "cublas64_12.dll";
+constexpr const char* kCublasLtName = "cublasLt64_12.dll";
 void* OpenLibrary(const std::string& path) { return LoadLibraryA(path.c_str()); }
 void* Symbol(void* handle, const char* name) {
     return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle), name));
@@ -36,6 +37,7 @@ std::string LastError() { return "LoadLibrary failed (" + std::to_string(GetLast
 constexpr const char* kDefaultRuntime = "libcudart.so.12";
 constexpr const char* kDefaultDriver = "libcuda.so.1";
 constexpr const char* kDefaultCublas = "libcublas.so.12";
+constexpr const char* kCublasLtName = "libcublasLt.so.12";
 // RTLD_GLOBAL so libcudart's own dependency on libcuda resolves to the same copy.
 void* OpenLibrary(const std::string& path) { return dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL); }
 void* Symbol(void* handle, const char* name) { return dlsym(handle, name); }
@@ -69,6 +71,11 @@ public:
             fn = hook_(symbol);
         } else if (std::strncmp(symbol, "cublas", 6) == 0) {
             if (void* cublas = Cublas()) fn = Symbol(cublas, symbol);
+            // On Linux the cuBLAS handle also finds its dependency libcublasLt's
+            // symbols; Windows' GetProcAddress does not search dependencies.
+            if (!fn && std::strncmp(symbol, "cublasLt", 8) == 0) {
+                if (void* lt = CublasLt()) fn = Symbol(lt, symbol);
+            }
         } else if (std::strncmp(symbol, "cuda", 4) == 0) {
             fn = Symbol(runtime_, symbol);
         } else if (driver_) {
@@ -97,11 +104,33 @@ private:
         return cublas_;
     }
 
+    // libcublasLt, next to the configured libcublas (cuBLAS depends on it, so
+    // this is normally the copy already loaded). Called with mutex_ held.
+    void* CublasLt() {
+        if (cublaslt_tried_) return cublaslt_;
+        cublaslt_tried_ = true;
+        const size_t slash = cublas_path_.find_last_of("/\\");
+        const std::string path =
+            slash == std::string::npos ? kCublasLtName : cublas_path_.substr(0, slash + 1) + kCublasLtName;
+        void* handle = OpenLibrary(path);
+        if (!handle) {
+            std::fprintf(stderr, "tuna: cuBLASLt unavailable: %s: %s\n", path.c_str(), LastError().c_str());
+        } else if (Symbol(handle, "tuna_cublaslt_shim")) {
+            std::fprintf(stderr, "tuna: %s is Tuna's client shim, not NVIDIA's cuBLASLt\n", path.c_str());
+            CloseLibrary(handle);
+        } else {
+            cublaslt_ = handle;
+        }
+        return cublaslt_;
+    }
+
     void* runtime_;
     void* driver_;
     std::string cublas_path_;
     void* cublas_ = nullptr;
     bool cublas_tried_ = false;
+    void* cublaslt_ = nullptr;
+    bool cublaslt_tried_ = false;
     ResolveHook hook_ = nullptr;
     std::mutex mutex_;
     std::unordered_map<std::string, void*> cache_;

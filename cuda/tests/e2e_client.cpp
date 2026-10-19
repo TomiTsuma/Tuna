@@ -145,8 +145,12 @@ int main(int argc, char** argv) {
     Ok(cudaMemcpy(back.data(), dbig, big, cudaMemcpyDeviceToHost), "cudaMemcpy D2H 40 MiB");
     Check(out == back, "40 MiB round trip over the bulk channel");
 
-    // A failed asynchronous launch is reported at the next synchronization.
-    Ok(cudaLaunchKernel(&vec_add_stub, dim3(1), dim3(4096), args, 0, nullptr), "invalid launch (queued)");
+    // A bad launch configuration is reported by the launch itself, as CUDA does...
+    const cudaError_t config = cudaLaunchKernel(&vec_add_stub, dim3(1), dim3(4096), args, 0, nullptr);
+    Check(config == cudaErrorInvalidConfiguration && cudaGetLastError() == cudaErrorInvalidConfiguration,
+          std::string("invalid configuration reported at launch: ") + cudaGetErrorName(config));
+    // ...and a launch that fails on the device at the next synchronization.
+    Ok(cudaLaunchKernel(&vec_add_stub, dim3(1), dim3(256), args, 1 << 20, nullptr), "invalid launch (queued)");
     const cudaError_t sync = cudaDeviceSynchronize();
     Check(sync == cudaErrorInvalidValue, std::string("invalid launch reported at sync: ") + cudaGetErrorName(sync));
     cudaGetLastError();
