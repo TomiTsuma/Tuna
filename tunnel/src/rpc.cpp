@@ -192,6 +192,13 @@ CallResult RpcClient::Call(uint32_t api_id, const std::string& args, bool synchr
     return result;
 }
 
+std::optional<int32_t> RpcClient::ArrivedAsyncError(bool clear) {
+    std::lock_guard<std::mutex> lock(calls_mutex_);
+    std::optional<int32_t> error = latched_error_;
+    if (clear) latched_error_.reset();
+    return error;
+}
+
 void RpcClient::Enqueue(RpcRequest request, std::unique_lock<std::mutex>& lock) {
     const bool was_empty = batch_.calls_size() == 0;
     batch_bytes_ += request.args().size();

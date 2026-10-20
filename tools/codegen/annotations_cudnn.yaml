@@ -1,0 +1,60 @@
+# cuDNN 9 (cudnn.h) functions remoted by Tuna's replacement libcudnn.so.9 /
+# cudnn64_9.dll (Phase 3g).
+#
+# Why cuDNN: PyTorch runs convolutions and batch norm through cuDNN, and
+# NVIDIA's libcudnn cannot run on a client without a GPU. Like cuBLASLt it is
+# remoted at its API.
+#
+# What PyTorch 2.8 actually calls for a ResNet-18 training loop was measured
+# with tools/cudnn_trace (see docs/changelog, Phase 3g):
+#   * convolutions through the backend ("graph") API: descriptors created,
+#     configured attribute by attribute, finalized; heuristics and engine
+#     configs read back with GetAttribute; per call a variant pack (the
+#     tensors' device pointers) plus one execute;
+#   * batch norm through the legacy API (cudnnBatchNormalization*Ex) with
+#     legacy tensor descriptors, and three workspace/reserve size queries per
+#     batch-norm call.
+#
+# Everything is hand-written (cuda/src/cudnn_client.cpp,
+# cuda/src/dispatch_cudnn.cpp) around the cuBLASLt idea: the client names the
+# descriptor objects (ids it allocates), so creating, configuring and
+# destroying them is fire-and-forget. The server maps the ids to the real
+# objects and refuses ids it does not hold.
+#
+# This file only lists names: special = remoted (by hand), local = client
+# only. Every other libcudnn export (cudnn9_exports.txt) is generated as a
+# stub returning CUDNN_STATUS_NOT_SUPPORTED.
+
+special:
+  cudnnCreate: handle
+  cudnnDestroy: handle
+  cudnnSetStream: handle
+  cudnnGetVersion: version
+  cudnnGetMaxDeviceVersion: version
+  cudnnGetCudartVersion: version
+  cudnnGetLastErrorString: error
+  cudnnCreateTensorDescriptor: tensor
+  cudnnSetTensorNdDescriptor: tensor
+  cudnnDestroyTensorDescriptor: tensor
+  cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize: size
+  cudnnGetBatchNormalizationBackwardExWorkspaceSize: size
+  cudnnGetBatchNormalizationTrainingExReserveSpaceSize: size
+  cudnnBatchNormalizationForwardTrainingEx: batchnorm
+  cudnnBatchNormalizationBackwardEx: batchnorm
+  cudnnBatchNormalizationForwardInference: batchnorm
+  cudnnBackendCreateDescriptor: backend
+  cudnnBackendDestroyDescriptor: backend
+  cudnnBackendSetAttribute: backend
+  cudnnBackendGetAttribute: backend
+  cudnnBackendFinalize: backend
+  cudnnBackendExecute: backend
+
+local:
+  - cudnnGetStream
+  - cudnnGetTensorNdDescriptor
+  - cudnnGetErrorString
+  - cudnnGetProperty
+  - cudnnGraphVersionCheck
+  - cudnnOpsVersionCheck
+  - cudnnCnnVersionCheck
+  - cudnnAdvVersionCheck

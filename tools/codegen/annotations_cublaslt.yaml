@@ -1,0 +1,42 @@
+# cuBLASLt (cublasLt.h) functions remoted by Tuna's replacement
+# libcublasLt.so.12 / cublasLt64_12.dll (Phase 3f).
+#
+# Why cuBLASLt: PyTorch's nn.Linear with a bias (addmm) runs as one cuBLASLt
+# matmul with a bias epilogue. NVIDIA's libcublasLt cannot run on a client
+# without a GPU, so like cuBLAS it is remoted at its API.
+#
+# Its API is descriptor-based: a matmul descriptor, one layout per matrix and
+# a preference object are created, configured attribute by attribute, used
+# for one heuristic query and one matmul, then destroyed, for every GEMM.
+# Everything is therefore hand-written (cuda/src/cublaslt_client.cpp,
+# cuda/src/dispatch_cublaslt.cpp) around one idea: the client names the
+# descriptor objects itself (ids it allocates), so create, set-attribute,
+# destroy and the matmul are all fire-and-forget, and a GEMM costs one round
+# trip (the heuristic query) instead of ~15. The server maps the ids to the
+# real objects and refuses ids it does not hold.
+#
+# This file only lists names: special = remoted (by hand), local = client
+# only. Every other libcublasLt export (cublasLt12_exports.txt) is generated
+# as a stub returning CUBLAS_STATUS_NOT_SUPPORTED.
+
+special:
+  cublasLtCreate: handle
+  cublasLtDestroy: handle
+  cublasLtMatmulDescCreate: object
+  cublasLtMatmulDescDestroy: object
+  cublasLtMatmulDescSetAttribute: object
+  cublasLtMatrixLayoutCreate: object
+  cublasLtMatrixLayoutDestroy: object
+  cublasLtMatrixLayoutSetAttribute: object
+  cublasLtMatmulPreferenceCreate: object
+  cublasLtMatmulPreferenceDestroy: object
+  cublasLtMatmulPreferenceSetAttribute: object
+  cublasLtMatmulAlgoGetHeuristic: heuristic
+  cublasLtMatmul: matmul
+
+local:
+  - cublasLtGetVersion
+  - cublasLtGetCudartVersion
+  - cublasLtGetProperty
+  - cublasLtGetStatusName
+  - cublasLtGetStatusString

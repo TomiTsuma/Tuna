@@ -107,6 +107,11 @@ public:
     // Fire-and-forget. Errors surface on the next synchronizing Call().
     void Post(uint32_t api_id, const std::string& args, std::string_view bulk_in = {});
 
+    // The first failed Post() whose answer has already arrived, without a
+    // round trip (and without flushing queued posts); `clear` resets it, as a
+    // synchronizing Call() would. A failure still in flight is not seen yet.
+    std::optional<int32_t> ArrivedAsyncError(bool clear);
+
     bool connected() const { return connected_; }
 
     // Flushes queued posts, then closes. Idempotent; the destructor calls it.

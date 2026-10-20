@@ -1,0 +1,11 @@
+/* Linux export list for the replacement libcuda.so.1. NVIDIA's driver library
+   exports its cu* symbols without version nodes, so this script only filters:
+   the driver API (and Tuna's marker) is exported, everything else - including
+   anything statically linked in - stays local. */
+{
+  global:
+    cu*;
+    tuna_cuda_driver_shim;
+  local:
+    *;
+};

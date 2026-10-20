@@ -21,15 +21,15 @@ using namespace tuna;
 using namespace tuna::cudart;
 
 namespace {
-CudaBackend* g_backend = nullptr;
+CudaSession* g_session = nullptr;
 
 // In-process stand-in for the transport: run the real dispatcher.
-Reply InProcessCall(uint32_t api_id, const std::string& args, const std::string& bulk_in) {
+Reply InProcessCall(uint32_t api_id, const std::string& args, const std::string& bulk_in, bool) {
     RpcRequest request;
     request.set_api_id(api_id);
     request.set_args(args);
     std::string bulk_out;
-    RpcResponse resp = CudaDispatch(request, bulk_in, &bulk_out, *g_backend);
+    RpcResponse resp = g_session->Dispatch(request, bulk_in, &bulk_out);
     Reply reply;
     reply.result = resp.result();
     reply.out_args = resp.out_args();
@@ -45,12 +45,13 @@ int fail(const char* what, cudaError_t e) {
 
 int main() {
     std::string error;
-    auto backend = OpenRealCuda(nullptr, &error);
+    auto backend = OpenRealCuda({}, &error);
     if (!backend) {
         std::fprintf(stderr, "cannot open libcudart: %s\n", error.c_str());
         return 1;
     }
-    g_backend = backend.get();
+    CudaSession session(*backend);
+    g_session = &session;
     SetCallHook(InProcessCall);
 
     int count = 0;

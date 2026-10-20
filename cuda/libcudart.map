@@ -1,0 +1,15 @@
+/* Linux version script for the replacement libcudart.so.12. The node name
+   matches NVIDIA's, so binaries linked against the real runtime (whose imports
+   are versioned "libcudart.so.12") bind to the shim. Everything else - the
+   statically linked tunnel, protobuf and OpenSSL glue - stays local, so it can
+   never interpose on an application's own copies. */
+libcudart.so.12 {
+  global:
+    cuda*;
+    __cuda*;
+    tuna_cudart_shim;
+    tuna_cudart_call;   /* bridge for Tuna's libcublas and libcuda (tuna/cuda/bridge.h) */
+    tuna_cudart_context_generation;
+  local:
+    *;
+};

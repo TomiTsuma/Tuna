@@ -1,38 +1,130 @@
 # Pointer semantics for CUDA runtime functions that libclang cannot infer.
-# Each entry maps a parameter to how it crosses the wire:
+# Each entry maps EVERY parameter to how it crosses the wire:
 #   in_scalar   - value copied into the request (int, size_t, enum, ...)
-#   in_handle   - an opaque device pointer the server issued; sent as uint64
+#   in_handle   - an opaque server-owned handle (device pointer, stream, event);
+#                 sent as uint64, never dereferenced by the client
+#   in_struct   - a const pointer to a fixed-size struct, copied into the request
 #   out_scalar  - the function writes one scalar; returned in the response
-#   out_handle  - the function writes a device pointer (void**); returned as uint64
+#   out_handle  - the function writes a handle (void**, cudaStream_t*, ...)
 #   out_struct  - the function writes a fixed-size struct; returned as bytes
-# A function listed with `special: NAME` is marshalled by hand (see
-# cuda_special.cpp) and the generator emits only its api_id.
+# Function flags:
+#   _async: true  fire-and-forget (batched, returns cudaSuccess at once; a
+#                 failure surfaces on the next synchronizing call, which is how
+#                 CUDA reports asynchronous errors anyway). No OUT params.
+#   _sync: true   a synchronizing call: it reports a latched async error.
+#   _wrap: true   the generated client stub is static (tuna_remote_<name>) and
+#                 a hand-written export in client_runtime.cpp wraps it (caching,
+#                 allocation tracking, context-generation bumps).
 #
-# Functions NOT listed here are generated as stubs returning
-# cudaErrorNotSupported (3), so coverage grows as real apps show what they use.
+# special:  remoted, but marshalled by hand (cuda/src/dispatch.cpp + client_*.cpp)
+# local:    implemented entirely in the client shim (no round trip)
+# Every other libcudart export (cudart12_exports.txt) is generated as a stub
+# returning cudaErrorNotSupported (801), so coverage grows as apps need it.
 
 functions:
-  cudaGetDeviceCount:
-    count: out_scalar
-  cudaGetDevice:
-    device: out_scalar
-  cudaSetDevice:
-    device: in_scalar
-  cudaDeviceSynchronize: {}
+  # --- device management
+  cudaGetDeviceCount: {count: out_scalar}
+  # Cached by the client after the first answer (cudaSetDevice keeps it current).
+  cudaGetDevice: {_wrap: true, device: out_scalar}
+  cudaSetDevice: {_wrap: true, device: in_scalar}
+  cudaDeviceSynchronize: {_sync: true}
   # CUDA 12 redirects cudaGetDeviceProperties -> _v2 via a macro, so the real
   # exported symbol (and the one the app's call resolves to) is the _v2 name.
-  cudaGetDeviceProperties_v2:
-    prop: out_struct
-    device: in_scalar
-  cudaMalloc:
-    devPtr: out_handle
-    size: in_scalar
-  cudaFree:
-    devPtr: in_handle
-  cudaMemGetInfo:
-    free: out_scalar
-    total: out_scalar
+  cudaGetDeviceProperties_v2: {_wrap: true, prop: out_struct, device: in_scalar}
+  cudaDeviceGetAttribute: {_wrap: true, value: out_scalar, attr: in_scalar, device: in_scalar}
+  cudaDeviceCanAccessPeer: {canAccessPeer: out_scalar, device: in_scalar, peerDevice: in_scalar}
+  cudaDeviceGetLimit: {pValue: out_scalar, limit: in_scalar}
+  cudaDeviceSetLimit: {limit: in_scalar, value: in_scalar}
+  cudaDeviceGetCacheConfig: {pCacheConfig: out_scalar}
+  cudaDeviceSetCacheConfig: {cacheConfig: in_scalar}
+  cudaDeviceGetStreamPriorityRange: {leastPriority: out_scalar, greatestPriority: out_scalar}
+  cudaSetDeviceFlags: {flags: in_scalar}
+  cudaGetDeviceFlags: {flags: out_scalar}
+  cudaChooseDevice: {device: out_scalar, prop: in_struct}
+  cudaDriverGetVersion: {driverVersion: out_scalar}
+
+  # --- memory
+  cudaMalloc: {_wrap: true, devPtr: out_handle, size: in_scalar}
+  cudaMallocPitch: {_wrap: true, devPtr: out_handle, pitch: out_scalar, width: in_scalar, height: in_scalar}
+  cudaFree: {_wrap: true, devPtr: in_handle}
+  cudaMemGetInfo: {free: out_scalar, total: out_scalar}
+  cudaMemset: {devPtr: in_handle, value: in_scalar, count: in_scalar}
+  cudaMemsetAsync: {_async: true, devPtr: in_handle, value: in_scalar, count: in_scalar, stream: in_handle}
+  cudaMemset2D: {devPtr: in_handle, pitch: in_scalar, value: in_scalar, width: in_scalar, height: in_scalar}
+  cudaPointerGetAttributes: {attributes: out_struct, ptr: in_handle}
+
+  # --- streams
+  cudaStreamCreate: {pStream: out_handle}
+  cudaStreamCreateWithFlags: {pStream: out_handle, flags: in_scalar}
+  cudaStreamCreateWithPriority: {pStream: out_handle, flags: in_scalar, priority: in_scalar}
+  cudaStreamDestroy: {stream: in_handle}
+  cudaStreamSynchronize: {_sync: true, stream: in_handle}
+  cudaStreamQuery: {stream: in_handle}
+  cudaStreamWaitEvent: {_async: true, stream: in_handle, event: in_handle, flags: in_scalar}
+  cudaStreamGetPriority: {hStream: in_handle, priority: out_scalar}
+  cudaStreamGetFlags: {hStream: in_handle, flags: out_scalar}
+
+  # --- events
+  cudaEventCreate: {event: out_handle}
+  cudaEventCreateWithFlags: {event: out_handle, flags: in_scalar}
+  cudaEventRecord: {_async: true, event: in_handle, stream: in_handle}
+  cudaEventRecordWithFlags: {_async: true, event: in_handle, stream: in_handle, flags: in_scalar}
+  cudaEventSynchronize: {_sync: true, event: in_handle}
+  cudaEventQuery: {event: in_handle}
+  cudaEventElapsedTime: {ms: out_scalar, start: in_handle, end: in_handle}
+  cudaEventDestroy: {event: in_handle}
 
 special:
   # kind decides direction, and the payload rides the bulk channel.
   cudaMemcpy: memcpy
+  cudaMemcpyAsync: memcpy
+  # Invalidates every module the server loaded into the reset context.
+  cudaDeviceReset: reset
+  # Merge the client's own last error with the server runtime's.
+  cudaGetLastError: last_error
+  cudaPeekAtLastError: last_error
+  # Tuna-internal calls behind kernel launch (no CUDA symbol of that name).
+  __tunaRegisterModule: module      # upload a fatbin image (bulk) -> module id
+  __tunaGetFunction: module         # (module, name) -> CUfunction + param layout
+  __tunaGetVar: module              # (module, name) -> device address + size
+  __tunaLaunchKernel: launch        # CUfunction, grid, block, smem, stream, params
+  __tunaFuncGetAttributes: func     # CUfunction -> cudaFuncAttributes
+  __tunaFuncSetAttribute: func
+  __tunaOccupancy: func             # cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags
+
+local:
+  - cudaGetErrorName
+  - cudaGetErrorString
+  - cudaRuntimeGetVersion
+  - cudaMallocHost
+  - cudaHostAlloc
+  - cudaFreeHost
+  - cudaHostRegister
+  - cudaHostUnregister
+  - cudaHostGetFlags
+  - cudaProfilerStart
+  - cudaProfilerStop
+  # Graph capture is not supported (cudaStreamBeginCapture reports so), so no
+  # stream is ever capturing; PyTorch asks before allocator work.
+  - cudaStreamIsCapturing
+  # kernel registration + launch (cuda/src/client_launch.cpp)
+  - __cudaRegisterFatBinary
+  - __cudaRegisterFatBinaryEnd
+  - __cudaUnregisterFatBinary
+  - __cudaRegisterFunction
+  - __cudaRegisterVar
+  - __cudaPushCallConfiguration
+  - __cudaPopCallConfiguration
+  - __cudaInitModule
+  - cudaLaunchKernel
+  - cudaFuncGetAttributes
+  - cudaFuncSetAttribute
+  - cudaFuncSetCacheConfig
+  - cudaOccupancyMaxActiveBlocksPerMultiprocessor
+  - cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags
+  - cudaMemcpyToSymbol
+  - cudaMemcpyFromSymbol
+  - cudaMemcpyToSymbolAsync
+  - cudaMemcpyFromSymbolAsync
+  - cudaGetSymbolAddress
+  - cudaGetSymbolSize
