@@ -1,11 +1,15 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/interfaces/catch_interfaces_capture.hpp>
 #include <fstream>
 #include <filesystem>
+#include <functional>
 #include "core/config_manager.h"
 
 namespace {
+// One file per test case: ctest runs the cases as parallel processes.
 std::filesystem::path writeTempConfig(const std::string& json) {
-    auto path = std::filesystem::temp_directory_path() / "tuna_server_test_config.json";
+    const size_t test = std::hash<std::string>{}(Catch::getResultCapture().getCurrentTestName());
+    auto path = std::filesystem::temp_directory_path() / ("tuna_server_test_config_" + std::to_string(test) + ".json");
     std::ofstream out(path);
     out << json;
     return path;
