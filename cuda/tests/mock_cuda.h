@@ -24,6 +24,9 @@ struct MockCudaStats {
     uint64_t attribute_queries = 0;
     uint64_t blas_calls = 0;  // cuBLAS compute calls executed (gemm, axpy, dot, ...)
     uint64_t driver_queries = 0;  // driver device / primary-context queries answered
+    uint64_t dnn_size_queries = 0;  // cuDNN batch-norm workspace / reserve size queries answered
+    uint64_t dnn_finalizes = 0;     // cuDNN backend descriptors finalized
+    uint64_t dnn_executes = 0;      // cuDNN computations run (convolutions, batch norms)
 };
 
 // In-process use (tuna_cuda_tests): a fresh device, and counters.

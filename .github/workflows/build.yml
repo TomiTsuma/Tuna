@@ -141,22 +141,38 @@ jobs:
           curl -sSfL "$CUDA_REDIST/libcublas/linux-x86_64/libcublas-linux-x86_64-12.8.4.1-archive.tar.xz" \
             | tar -xJ --strip-components=1 -C "$HOME/cublas" --wildcards '*/include/*'
 
+      # cuDNN 9 headers only, the same way (that archive is ~1 GB of libraries).
+      # 9.10.2.21 is the version PyTorch 2.8's cu128 wheels pin.
+      - name: Cache cuDNN 9.10 headers
+        id: cudnn-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/cudnn
+          key: cudnn-headers-linux-x86_64-9.10.2.21_cuda12
+
+      - name: Fetch cuDNN 9.10 headers (NVIDIA redistributable)
+        if: steps.cudnn-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/cudnn"
+          curl -sSfL "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/linux-x86_64/cudnn-linux-x86_64-9.10.2.21_cuda12-archive.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$HOME/cudnn" --wildcards '*/include/*'
+
       - name: Committed codegen output is current
         run: |
           python3 tools/codegen/gen_cuda.py "$HOME/cuda/include" tools/codegen/annotations.yaml cuda/generated \
-            --cublas "$HOME/cublas/include"
+            --cublas "$HOME/cublas/include" --cudnn "$HOME/cudnn/include"
           git diff --exit-code -- cuda/generated tools/codegen/api_ids.yaml
           # A newly generated file that was never committed is stale too.
           test -z "$(git status --porcelain -- cuda/generated tools/codegen/api_ids.yaml)"
 
-      - name: Configure server with the CUDA shim (+ cuBLAS)
+      - name: Configure server with the CUDA shim (+ cuBLAS, cuDNN)
         run: |
           cmake -S tuna-server -B build-cuda -DTUNA_SERVER_WORKLOAD_API=OFF -DTUNA_BUILD_CUDA_SHIM=ON \
             -DTUNA_CUDA_INCLUDE_DIR="$HOME/cuda/include" -DTUNA_CUBLAS_INCLUDE_DIR="$HOME/cublas/include" \
-            -DCMAKE_BUILD_TYPE=Release
+            -DTUNA_CUDNN_INCLUDE_DIR="$HOME/cudnn/include" -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build-cuda --parallel
 
-      - name: Run tests (unit, marshalling, CUDA + cuBLAS + driver end-to-end over TCP and mTLS)
+      - name: Run tests (unit, marshalling, CUDA + cuBLAS + cuDNN + driver end-to-end over TCP and mTLS)
         run: ctest --test-dir build-cuda --output-on-failure

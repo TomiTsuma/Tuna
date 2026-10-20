@@ -22,6 +22,7 @@ struct ServerCudaConfig {
     std::string runtime_library;  // NVIDIA libcudart; empty = libcudart.so.12 / cudart64_12.dll
     std::string driver_library;   // NVIDIA libcuda; empty = libcuda.so.1 / nvcuda.dll
     std::string cublas_library;   // NVIDIA libcublas; empty = libcublas.so.12 / cublas64_12.dll
+    std::string cudnn_library;    // NVIDIA libcudnn; empty = libcudnn.so.9 / cudnn64_9.dll
 };
 
 struct ServerConfig {

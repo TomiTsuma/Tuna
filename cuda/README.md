@@ -23,9 +23,11 @@ Since Phase 3d the shim set also replaces **cuBLAS** (`libcublas.so.12` /
 also replaces the **driver library** (`libcuda.so.1` / `nvcuda.dll`): see
 [Driver API](#driver-api-phase-3e). Since Phase 3f it also replaces
 **cuBLASLt** (`libcublasLt.so.12` / `cublasLt64_12.dll`): see
-[cuBLASLt](#cublaslt-phase-3f). With these four shims, an unmodified PyTorch
-on a client with no NVIDIA GPU sees the server's GPU (plan milestone 4).
-It also trains a model there, with bit-identical results (milestone 5, MLP).
+[cuBLASLt](#cublaslt-phase-3f). Since Phase 3g it also replaces **cuDNN**
+(`libcudnn.so.9` / `cudnn64_9.dll`): see [cuDNN](#cudnn-phase-3g). With
+these five shims, an unmodified PyTorch on a client with no NVIDIA GPU sees
+the server's GPU (plan milestone 4). It also trains models there, an MLP and
+a ResNet-18, with bit-identical results (milestone 5).
 
 ## What crosses the wire
 
@@ -126,6 +128,60 @@ matmul.
   Version, property and status-string queries are local. Everything else is
   `CUBLAS_STATUS_NOT_SUPPORTED`.
 
+## cuDNN (Phase 3g)
+
+PyTorch runs convolutions and batch norm through cuDNN 9. `libcudnn.so.9`
+(Tuna's) exports cuDNN's full ABI (224 symbols, version node `libcudnn.so.9`)
+and remotes the 22 calls a training loop makes, as measured with
+`tools/cudnn_trace` on ResNet-18:
+
+- **Convolutions** use the backend ("graph") API: `cudnnBackendCreateDescriptor`,
+  `SetAttribute`, `GetAttribute`, `Finalize`, `Execute`, `DestroyDescriptor`.
+  PyTorch (through the cuDNN frontend) builds an execution plan once per
+  convolution shape. That takes ~90 descriptors per plan. After that, each
+  convolution is one variant pack (the tensors' device pointers) plus one
+  execute.
+- **Batch norm** uses the legacy API (`cudnnBatchNormalization*Ex`,
+  `...ForwardInference`) with legacy tensor descriptors, plus three
+  workspace/reserve size queries per call.
+
+How it is remoted:
+
+- **The client names the descriptor objects** (as for cuBLASLt): create,
+  set-attribute and destroy are fire-and-forget, and the server maps ids to
+  the real objects. A descriptor-typed attribute crosses as ids and is
+  translated on the server. `GetAttribute` into descriptors the caller
+  created (heuristic results, engine configs) sends their ids, and the server
+  fills the real ones.
+- **What waits for the server:** `GetAttribute`, and `Finalize` of everything
+  except a variant pack. The frontend tries engine configs in turn and needs
+  each plan's real status. A variant pack only bundles pointers, so its
+  finalize is posted, like `Execute` and batch norm. **A training step's cuDNN
+  calls cost no round trip at all.**
+- **Batch-norm size queries are cached** on the client, keyed by handle,
+  mode, ops and the tensor descriptors' contents (which the client mirrors).
+  PyTorch asks for them on every call; only the first query per shape goes
+  to the server.
+- **Server checks:** ids must be this session's objects of the right kind
+  (legacy tensor vs backend descriptor); handles, whether as arguments or as
+  `CUDNN_TYPE_HANDLE` attributes, must be ones this session created; an
+  attribute element type Tuna does not know is refused; values are copied into
+  an aligned buffer of exactly the size sent.
+- **Host memory:** cuDNN dereferences scalars (copied into local storage, as
+  for cuBLAS) and *by-value tensors*, whose "data pointer" is host memory.
+  By-value tensors are refused on both sides, and `CUDNN_TYPE_VOID_PTR`
+  (device addresses) is only accepted by a variant pack.
+- `cudnnGetVersion` and friends return the **server's** library version
+  (asked once), so the frontend's version checks see the cuDNN that actually
+  runs. Status strings, `cudnnGetStream` and `cudnnGetTensorNdDescriptor` are
+  answered locally. `cudnnGetLastErrorString` fetches the server's message.
+
+| ResNet-18 training (batch 32, loopback, RTX 4050) | native | through Tuna |
+|---|---|---|
+| losses, 30 steps, deterministic cuDNN | | **bit-identical** |
+| ms/step over 200 steps, incl. plan building | 24.2 – 24.6 | **26.7** |
+| blocking round trips per steady-state step | | 1.4 (the cuBLASLt heuristic and loss readbacks; cuDNN 0) |
+
 ## Performance: what a workload pays
 
 `TUNA_STATS=1` prints, at exit, how many calls of each API were blocking
@@ -191,6 +247,7 @@ a GPU, that library must be Tuna's too.
 | `include/tuna/cuda/cublas_client.h` | cuBLAS shim plumbing (call/post, status mapping, scalar refs) |
 | `include/tuna/cuda/driver_client.h` | driver shim plumbing (call, CUresult codes) |
 | `include/tuna/cuda/cublaslt_client.h` | cuBLASLt shim limits (attribute size, heuristic results) |
+| `include/tuna/cuda/cudnn_client.h` | cuDNN shim limits and the backend attribute element sizes (shared by client and server) |
 | `src/client.cpp` | session (lazy connect from env), call/post, last error |
 | `src/client_runtime.cpp` | memcpy family, host memory, caches, error strings |
 | `src/client_launch.cpp` | fatbin/kernel/variable registration, launch, symbols |
@@ -203,14 +260,16 @@ a GPU, that library must be Tuna's too.
 | `src/dispatch.cpp` | server: `CudaSession::Dispatch` (generated switch + hand-written calls) |
 | `src/dispatch_cublas.cpp` | server: cuBLAS (generated switch + matrix copies, async status mapping) |
 | `src/dispatch_driver.cpp` | server: driver API (generated switch + primary-context retain, device name) |
+| `src/cudnn_client.cpp`, `src/cudnn_unsupported.cpp` | cuDNN shim: client-named descriptors, posted variant packs, cached batch-norm sizes; the not-supported exports |
 | `src/dispatch_cublaslt.cpp` | server: cuBLASLt (object table, handle/kind/algo/scalar checks) |
-| `src/backend_real.cpp` | `dlopen` of NVIDIA's libcudart + libcuda (+ libcublas on first use); refuses to load Tuna's shims |
-| `libcudart.map`, `libcublas.map`, `libcublasLt.map`, `libcuda.map` | Linux version scripts (export only each library's API) |
+| `src/dispatch_cudnn.cpp` | server: cuDNN (object table, descriptor translation, handle/pointer/by-value checks) |
+| `src/backend_real.cpp` | `dlopen` of NVIDIA's libcudart + libcuda (+ libcublas, libcudnn on first use); refuses to load Tuna's shims |
+| `libcudart.map`, `libcublas.map`, `libcublasLt.map`, `libcudnn.map`, `libcuda.map` | Linux version scripts (export only each library's API) |
 | `generated/` | committed codegen output (CI checks it is current) |
 | `samples/*.cu` | real-GPU milestone programs (deviceQuery, vectorAdd, matrixMul, symbols/streams, cuBLAS sgemm) |
-| `samples/torch_*.py` | PyTorch milestone programs (4: matmul; 5: a training loop) |
-| `tests/test_marshal.cpp`, `tests/test_cublas.cpp`, `tests/test_cublaslt.cpp`, `tests/test_driver.cpp` | GPU-free round trips through `CudaSession` + the mock |
-| `tests/mock_cuda.cpp` | mock CUDA stack: device memory in host buffers, three kernels, one `__constant__`, a small cuBLAS |
+| `samples/torch_*.py` | PyTorch milestone programs (4: matmul; 5: training an MLP and a ResNet-18) |
+| `tests/test_marshal.cpp`, `tests/test_cublas.cpp`, `tests/test_cublaslt.cpp`, `tests/test_cudnn.cpp`, `tests/test_driver.cpp` | GPU-free round trips through `CudaSession` + the mock |
+| `tests/mock_cuda.cpp` | mock CUDA stack: device memory in host buffers, three kernels, one `__constant__`, a small cuBLAS, a small cuDNN (batch norm, a single-convolution graph) |
 | `tests/e2e_client.cpp`, `tests/e2e_cublas_client.cpp`, `tests/e2e_driver_client.cpp` + `tests/integration/test_cuda_e2e.py` | real binaries end to end (TCP and mTLS), mock instead of a GPU |
 | `tests/integration/test_gpu_samples.py` | nvcc-built samples natively and through Tuna on a real GPU |
 | `tests/integration/test_torch.py` | PyTorch samples natively and through Tuna on a real GPU, with the client's own GPU hidden |
@@ -223,12 +282,14 @@ Needs CUDA 12 **headers** (a toolkit, or NVIDIA's redistributable
 cuBLAS shim is built when `cublas_v2.h` is found (in the toolkit include dir,
 or point `TUNA_CUBLAS_INCLUDE_DIR` at the `libcublas` redistributable's or the
 `nvidia-cublas-cu12` wheel's `include/`); without it, cuBLAS calls report "not
-supported" and everything else is unchanged:
+supported" and everything else is unchanged. The cuDNN shim works the same
+way with `TUNA_CUDNN_INCLUDE_DIR` (cuDNN 9's `cudnn.h`, from the `cudnn`
+redistributable or the `nvidia-cudnn-cu12` wheel):
 
 ```bash
 cmake -S tuna-server -B build -DTUNA_SERVER_WORKLOAD_API=OFF \
       -DTUNA_BUILD_CUDA_SHIM=ON -DTUNA_CUDA_INCLUDE_DIR=/path/to/cuda-12/include \
-      [-DTUNA_CUBLAS_INCLUDE_DIR=/path/to/cublas/include]
+      [-DTUNA_CUBLAS_INCLUDE_DIR=/path/to/cublas/include] [-DTUNA_CUDNN_INCLUDE_DIR=/path/to/cudnn/include]
 cmake --build build -j
 ctest --test-dir build --output-on-failure    # includes tuna_cuda_e2e (mock GPU, + cuBLAS)
 ```
@@ -244,7 +305,7 @@ python3 cuda/tests/integration/test_gpu_samples.py --server build/tuna_server \
 
 PyTorch (milestones 4 and 5) works with any CUDA 12 build of torch, e.g.
 `pip install torch --index-url https://download.pytorch.org/whl/cu128`. The
-server's runtime and cuBLAS come from the same install's `nvidia-*` wheels.
+server's runtime, cuBLAS and cuDNN come from the same install's `nvidia-*` wheels.
 The client's own GPU is hidden in a user + mount namespace, so nothing can
 silently bypass Tuna:
 
@@ -258,14 +319,15 @@ python3 cuda/tests/integration/test_torch.py --server build/tuna_server \
 ```bash
 # GPU box: tuna_server --foreground --config server.json, where server.json has
 #   "cuda": {"runtime_library": "/usr/local/cuda/lib64/libcudart.so.12",   (optional)
-#            "cublas_library": "/usr/local/cuda/lib64/libcublas.so.12"}   (optional)
+#            "cublas_library": "/usr/local/cuda/lib64/libcublas.so.12",   (optional)
+#            "cudnn_library": "/path/to/cudnn/lib/libcudnn.so.9"}         (optional)
 # Client:
 export TUNA_SERVER=gpu-box:7000
 export TUNA_CA_CERT=ca.crt TUNA_CLIENT_CERT=alice.crt TUNA_CLIENT_KEY=alice.key  # mTLS
 LD_LIBRARY_PATH=/path/to/build/shim ./my_cuda_app
 # Libraries that find CUDA through RPATH (PyTorch's) ignore LD_LIBRARY_PATH:
 S=/path/to/build/shim
-LD_PRELOAD=$S/libcudart.so.12:$S/libcublas.so.12:$S/libcublasLt.so.12:$S/libcuda.so.1 python train.py
+LD_PRELOAD=$S/libcudart.so.12:$S/libcublas.so.12:$S/libcublasLt.so.12:$S/libcudnn.so.9:$S/libcuda.so.1 python train.py
 ```
 
 On Windows, put the shim DLLs **next to the application's .exe**. Windows
@@ -300,9 +362,15 @@ already handle as "no GPU".
   failure only if the server's answer has already arrived; set
   `CUDA_LAUNCH_BLOCKING=1` to have it wait.
 - Libraries that bundle their own GPU code paths without going through
-  libcudart need their own API shims. cuBLAS (3d) and cuBLASLt (3f) have one.
-  cuDNN, cuFFT, cuRAND, cuSPARSE and NCCL do not yet; PyTorch's convolutions
-  need cuDNN.
+  libcudart need their own API shims. cuBLAS (3d), cuBLASLt (3f) and cuDNN
+  (3g) have one. cuFFT, cuRAND, cuSPARSE and NCCL do not yet.
+- cuDNN: the calls PyTorch's convolutions and batch norm make are remoted
+  (convolutions through the backend API only; the legacy convolution API,
+  pooling, activation/dropout/RNN/CTC descriptors are not). By-value tensors
+  are refused. A posted call's failure (a bad attribute, a refused id, a
+  failed execute) is reported by the next synchronizing CUDA call. Building
+  an execution plan costs ~65 round trips per convolution shape (one-time;
+  ResNet-18 has 32 shapes counting backward passes).
 - cuBLASLt: the calls PyTorch's GEMMs make are remoted; descriptor queries
   (`...GetAttribute`), `cublasLtMatmulAlgoInit` and the matrix transforms are
   not yet. A posted call's failure (a bad attribute, a refused algo) is
@@ -324,7 +392,8 @@ already handle as "no GPU".
    role; mark fire-and-forget calls `_async`, synchronizing ones `_sync`;
    cuBLAS scalars are `in_scalar_ref` / `out_scalar_ref`.
 2. Regenerate: `python tools/codegen/gen_cuda.py <cuda-12>/include
-   tools/codegen/annotations.yaml cuda/generated --cublas <cublas>/include`;
+   tools/codegen/annotations.yaml cuda/generated --cublas <cublas>/include
+   --cudnn <cudnn>/include`;
    this also appends the new name to `tools/codegen/api_ids.yaml` (ids are
    append-only, never reused).
 3. Commit `cuda/generated/` and `api_ids.yaml`. If the function does not fit

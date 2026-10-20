@@ -1,0 +1,11 @@
+/* Linux version script for the replacement libcudnn.so.9. The node name
+   matches NVIDIA's, so binaries linked against the real cuDNN (whose imports
+   are versioned "libcudnn.so.9", as PyTorch's are) bind to the shim.
+   Everything else stays local. */
+libcudnn.so.9 {
+  global:
+    cudnn*;
+    tuna_cudnn_shim;
+  local:
+    *;
+};

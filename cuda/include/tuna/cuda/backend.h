@@ -69,6 +69,8 @@ private:
     bool DispatchCublasLt(const RpcRequest& request, RpcResponse& resp);
     // The real object behind a client's cuBLASLt id, if it is of `kind`.
     void* LtObjectPtr(uint64_t id, int kind);
+    // cuDNN calls (dispatch_cudnn.cpp; false when the build has no cuDNN headers).
+    bool DispatchCudnn(const RpcRequest& request, RpcResponse& resp);
     // Driver API calls (dispatch_driver.cpp).
     bool DispatchDriver(const RpcRequest& request, RpcResponse& resp);
     // cuInit(0) in this worker, once; 0 or the CUresult that failed.
@@ -111,6 +113,17 @@ private:
     std::map<uint64_t, LtObject> lt_objects_;
     std::set<void*> lt_handles_;
     std::set<std::string> lt_algos_;
+    // cuDNN: the descriptor objects, named by the client (see
+    // cudnn_client.cpp), and the handles this session created (host pointers
+    // in this process, so no other value reaches cuDNN as a handle).
+    enum CudnnKind { kCudnnBackend = 1, kCudnnTensor = 2 };
+    struct CudnnObject {
+        int kind;
+        int32_t type;  // backend descriptors: cudnnBackendDescriptorType_t
+        void* ptr;
+    };
+    std::map<uint64_t, CudnnObject> cudnn_objects_;
+    std::set<void*> cudnn_handles_;
     // Driver API state: whether cuInit succeeded, and the devices whose primary
     // context this session retained (kept until the worker exits).
     bool driver_initialized_ = false;

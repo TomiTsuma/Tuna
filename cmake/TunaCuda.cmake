@@ -14,6 +14,8 @@
 #                           through tuna_cudart's session
 #   tuna_cublaslt           the cuBLASLt shim (Phase 3f), with tuna_cublas:
 #                           <build>/shim/libcublasLt.so.12 or cublasLt64_12.dll
+#   tuna_cudnn              the cuDNN shim (Phase 3g), when the cuDNN 9 headers
+#                           are found: <build>/shim/libcudnn.so.9 or cudnn64_9.dll
 #   tuna_cuda_driver        the CUDA driver shim (Phase 3e): <build>/shim/libcuda.so.1
 #                           or <build>/shim/nvcuda.dll; also through tuna_cudart
 #   tuna_mock_cuda          a mock CUDA stack the server can load (tests)
@@ -72,6 +74,24 @@ else()
     message(STATUS "Tuna CUDA shim: cublas_v2.h not found, building without cuBLAS (set TUNA_CUBLAS_INCLUDE_DIR)")
 endif()
 
+# cuDNN 9 headers (cudnn.h): NVIDIA's cudnn redistributable or the
+# nvidia-cudnn-cu12 wheel's include/. Optional like cuBLAS: without them cuDNN
+# calls report "not supported".
+if(NOT TUNA_CUDNN_INCLUDE_DIR)
+    find_path(TUNA_CUDNN_INCLUDE_DIR cudnn.h PATHS "${TUNA_CUDA_INCLUDE_DIR}" NO_DEFAULT_PATH)
+endif()
+if(TUNA_CUDNN_INCLUDE_DIR)
+    file(READ "${TUNA_CUDNN_INCLUDE_DIR}/cudnn_version.h" _tuna_cudnn_version LIMIT 4000)
+    if(NOT _tuna_cudnn_version MATCHES "#define CUDNN_MAJOR 9")
+        message(FATAL_ERROR "TUNA_CUDNN_INCLUDE_DIR is not cuDNN 9 (the shim is libcudnn.so.9)")
+    endif()
+    set(TUNA_CUDA_HAVE_CUDNN ON)
+    message(STATUS "Tuna CUDA shim: cuDNN remoting enabled (${TUNA_CUDNN_INCLUDE_DIR})")
+else()
+    set(TUNA_CUDA_HAVE_CUDNN OFF)
+    message(STATUS "Tuna CUDA shim: cudnn.h not found, building without cuDNN (set TUNA_CUDNN_INCLUDE_DIR)")
+endif()
+
 # Codegen needs python + libclang + the CUDA headers, so by default the build
 # uses the committed stubs in cuda/generated/ and no codegen runs. Regenerate
 # them (into the build tree) with -DTUNA_REGEN_CUDA=ON; commit the result by
@@ -81,11 +101,15 @@ set(_tuna_cuda_gen_names
     cuda_api_ids.h cuda_client_stubs.inc cuda_server_dispatch.inc cuda_unsupported_stubs.inc
     cuda_error_strings.inc cuda_coverage.inc
     driver_client_stubs.inc driver_server_dispatch.inc driver_unsupported_stubs.inc driver_error_strings.inc)
-set(_tuna_codegen_cublas_args)
+set(_tuna_codegen_lib_args)
 if(TUNA_CUDA_HAVE_CUBLAS)
     list(APPEND _tuna_cuda_gen_names cublas_client_stubs.inc cublas_server_dispatch.inc cublas_unsupported_stubs.inc
          cublaslt_unsupported_stubs.inc)
-    set(_tuna_codegen_cublas_args --cublas "${TUNA_CUBLAS_INCLUDE_DIR}")
+    set(_tuna_codegen_lib_args --cublas "${TUNA_CUBLAS_INCLUDE_DIR}")
+endif()
+if(TUNA_CUDA_HAVE_CUDNN)
+    list(APPEND _tuna_cuda_gen_names cudnn_unsupported_stubs.inc cudnn_status_names.inc)
+    list(APPEND _tuna_codegen_lib_args --cudnn "${TUNA_CUDNN_INCLUDE_DIR}")
 endif()
 if(TUNA_REGEN_CUDA)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -96,12 +120,13 @@ if(TUNA_REGEN_CUDA)
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${TUNA_CUDA_GEN_DIR}"
         COMMAND "${Python3_EXECUTABLE}" "${TUNA_CODEGEN_DIR}/gen_cuda.py"
                 "${TUNA_CUDA_INCLUDE_DIR}" "${TUNA_CODEGEN_DIR}/annotations.yaml" "${TUNA_CUDA_GEN_DIR}"
-                ${_tuna_codegen_cublas_args}
+                ${_tuna_codegen_lib_args}
         DEPENDS "${TUNA_CODEGEN_DIR}/gen_cuda.py" "${TUNA_CODEGEN_DIR}/annotations.yaml"
                 "${TUNA_CODEGEN_DIR}/cudart12_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_cublas.yaml"
                 "${TUNA_CODEGEN_DIR}/cublas12_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_driver.yaml"
                 "${TUNA_CODEGEN_DIR}/cuda12_driver_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_cublaslt.yaml"
-                "${TUNA_CODEGEN_DIR}/cublasLt12_exports.txt"
+                "${TUNA_CODEGEN_DIR}/cublasLt12_exports.txt" "${TUNA_CODEGEN_DIR}/annotations_cudnn.yaml"
+                "${TUNA_CODEGEN_DIR}/cudnn9_exports.txt"
         COMMENT "Generating CUDA runtime remoting stubs"
         VERBATIM)
     add_custom_target(tuna_cuda_codegen DEPENDS ${TUNA_CUDA_GENERATED})
@@ -114,6 +139,9 @@ set(_tuna_cuda_includes ${TUNA_CUDA_DIR}/include ${TUNA_CUDA_GEN_DIR} ${TUNA_CUD
 if(TUNA_CUDA_HAVE_CUBLAS)
     list(APPEND _tuna_cuda_includes ${TUNA_CUBLAS_INCLUDE_DIR})
 endif()
+if(TUNA_CUDA_HAVE_CUDNN)
+    list(APPEND _tuna_cuda_includes ${TUNA_CUDNN_INCLUDE_DIR})
+endif()
 set(_tuna_cuda_warnings $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>)
 
 # Server-side dispatcher.
@@ -122,6 +150,10 @@ if(TUNA_CUDA_HAVE_CUBLAS)
     target_sources(tuna_cuda_dispatch PRIVATE ${TUNA_CUDA_DIR}/src/dispatch_cublas.cpp
                    ${TUNA_CUDA_DIR}/src/dispatch_cublaslt.cpp)
     target_compile_definitions(tuna_cuda_dispatch PUBLIC TUNA_CUDA_HAVE_CUBLAS)
+endif()
+if(TUNA_CUDA_HAVE_CUDNN)
+    target_sources(tuna_cuda_dispatch PRIVATE ${TUNA_CUDA_DIR}/src/dispatch_cudnn.cpp)
+    target_compile_definitions(tuna_cuda_dispatch PUBLIC TUNA_CUDA_HAVE_CUDNN)
 endif()
 add_dependencies(tuna_cuda_dispatch tuna_cuda_codegen)
 target_include_directories(tuna_cuda_dispatch PUBLIC ${_tuna_cuda_includes})
@@ -217,6 +249,31 @@ if(TUNA_CUDA_HAVE_CUBLAS)
     endif()
 endif()
 
+# The cuDNN shim: libcudnn.so.9 / cudnn64_9.dll (PyTorch's convolutions and
+# batch norm). Same session bridge as cuBLAS.
+if(TUNA_CUDA_HAVE_CUDNN)
+    add_library(tuna_cudnn_client OBJECT
+        ${TUNA_CUDA_DIR}/src/cudnn_client.cpp
+        ${TUNA_CUDA_DIR}/src/cudnn_unsupported.cpp)
+    add_dependencies(tuna_cudnn_client tuna_cuda_codegen)
+    target_include_directories(tuna_cudnn_client PUBLIC ${_tuna_cuda_includes})
+    target_compile_options(tuna_cudnn_client PRIVATE ${_tuna_cuda_warnings})
+
+    add_library(tuna_cudnn SHARED $<TARGET_OBJECTS:tuna_cudnn_client>)
+    target_link_libraries(tuna_cudnn PRIVATE tuna_cudart)
+    set_target_properties(tuna_cudnn PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shim"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/shim")
+    if(WIN32)
+        set_target_properties(tuna_cudnn PROPERTIES OUTPUT_NAME cudnn64_9 PREFIX "")
+    else()
+        set_target_properties(tuna_cudnn PROPERTIES OUTPUT_NAME cudnn VERSION 9 SOVERSION 9)
+        target_link_options(tuna_cudnn PRIVATE
+            "LINKER:--version-script=${TUNA_CUDA_DIR}/libcudnn.map" "LINKER:--no-undefined")
+        set_property(TARGET tuna_cudnn APPEND PROPERTY LINK_DEPENDS "${TUNA_CUDA_DIR}/libcudnn.map")
+    endif()
+endif()
+
 # The driver shim: libcuda.so.1 / nvcuda.dll next to the runtime shim, for
 # programs and libraries that call the driver API (PyTorch's primary-context
 # checks, cuGetProcAddress lookups). Like libcublas, it sends through
@@ -251,6 +308,10 @@ if(TUNA_CUDA_HAVE_CUBLAS)
     target_include_directories(tuna_mock_cuda PRIVATE ${TUNA_CUBLAS_INCLUDE_DIR})
     target_compile_definitions(tuna_mock_cuda PRIVATE TUNA_CUDA_HAVE_CUBLAS)
 endif()
+if(TUNA_CUDA_HAVE_CUDNN)
+    target_include_directories(tuna_mock_cuda PRIVATE ${TUNA_CUDNN_INCLUDE_DIR})
+    target_compile_definitions(tuna_mock_cuda PRIVATE TUNA_CUDA_HAVE_CUDNN)
+endif()
 set_target_properties(tuna_mock_cuda PROPERTIES CXX_VISIBILITY_PRESET hidden)
 target_compile_options(tuna_mock_cuda PRIVATE ${_tuna_cuda_warnings})
 
@@ -278,6 +339,10 @@ function(tuna_add_cuda_tests)
         target_sources(tuna_cuda_tests PRIVATE ${TUNA_CUDA_DIR}/tests/test_cublas.cpp
                        ${TUNA_CUDA_DIR}/tests/test_cublaslt.cpp
                        $<TARGET_OBJECTS:tuna_cublas_client> $<TARGET_OBJECTS:tuna_cublaslt_client>)
+    endif()
+    if(TUNA_CUDA_HAVE_CUDNN)
+        target_sources(tuna_cuda_tests PRIVATE ${TUNA_CUDA_DIR}/tests/test_cudnn.cpp
+                       $<TARGET_OBJECTS:tuna_cudnn_client>)
     endif()
     catch_discover_tests(tuna_cuda_tests TEST_PREFIX "cuda: ")
 

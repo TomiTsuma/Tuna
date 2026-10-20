@@ -13,4 +13,7 @@ constexpr int32_t kCudaErrorNotSupported = 801;
 // next synchronizing CUDA call reports (dispatch_cublas.cpp).
 int32_t CublasAsyncError(int status);
 
+// The same for a cudnnStatus_t (dispatch_cudnn.cpp).
+int32_t CudnnAsyncError(int status);
+
 }  // namespace tuna::cudart

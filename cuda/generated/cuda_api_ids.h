@@ -124,7 +124,29 @@ enum TunaCudaApi : uint32_t {
     kApi_cublasLtMatrixLayoutCreate = 119,
     kApi_cublasLtMatrixLayoutDestroy = 120,
     kApi_cublasLtMatrixLayoutSetAttribute = 121,
+    kApi_cudnnBackendCreateDescriptor = 122,
+    kApi_cudnnBackendDestroyDescriptor = 123,
+    kApi_cudnnBackendExecute = 124,
+    kApi_cudnnBackendFinalize = 125,
+    kApi_cudnnBackendGetAttribute = 126,
+    kApi_cudnnBackendSetAttribute = 127,
+    kApi_cudnnBatchNormalizationBackwardEx = 128,
+    kApi_cudnnBatchNormalizationForwardInference = 129,
+    kApi_cudnnBatchNormalizationForwardTrainingEx = 130,
+    kApi_cudnnCreate = 131,
+    kApi_cudnnCreateTensorDescriptor = 132,
+    kApi_cudnnDestroy = 133,
+    kApi_cudnnDestroyTensorDescriptor = 134,
+    kApi_cudnnGetBatchNormalizationBackwardExWorkspaceSize = 135,
+    kApi_cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize = 136,
+    kApi_cudnnGetBatchNormalizationTrainingExReserveSpaceSize = 137,
+    kApi_cudnnGetCudartVersion = 138,
+    kApi_cudnnGetLastErrorString = 139,
+    kApi_cudnnGetMaxDeviceVersion = 140,
+    kApi_cudnnGetVersion = 141,
+    kApi_cudnnSetStream = 142,
+    kApi_cudnnSetTensorNdDescriptor = 143,
 };
 constexpr uint32_t kFirstCudaApi = 1;
-constexpr uint32_t kLastCudaApi = 121;
+constexpr uint32_t kLastCudaApi = 143;
 }  // namespace tuna::cudart

@@ -4,9 +4,10 @@ milestones 4 and 5).
 
 Runs each cuda/samples/torch_*.py twice with the same Python + PyTorch:
   native - on the local GPU (the reference);
-  tuna   - with Tuna's libcudart.so.12, libcublas.so.12, libcublasLt.so.12 and
-           libcuda.so.1 preloaded, against a local tuna_server whose worker runs NVIDIA's
-           runtime and cuBLAS (from the same PyTorch install) on that GPU.
+  tuna   - with Tuna's libcudart.so.12, libcublas.so.12, libcublasLt.so.12,
+           libcudnn.so.9 and libcuda.so.1 preloaded, against a local tuna_server
+           whose worker runs NVIDIA's runtime, cuBLAS and cuDNN (from the same
+           PyTorch install) on that GPU.
 
 By default the Tuna run also has **no GPU of its own**: on Linux the client is
 started in a user + mount namespace with /dev/dxg (WSL) or /dev/nvidia* bind-
@@ -15,7 +16,9 @@ silently using the local GPU. --keep-gpu turns that off.
 
 Each run must print PASS, and the lines that carry results ("checksum:",
 "loss step=...") must be identical natively and through Tuna: same GPU, same
-libraries, same inputs, so remoting must not change a single bit.
+libraries, same inputs, so remoting must not change a single bit. (The ResNet
+sample runs cuDNN in deterministic mode for this: otherwise its convolution
+backward passes accumulate with atomics, and even two native runs differ.)
 
 PyTorch's libraries find CUDA through RPATH, which LD_LIBRARY_PATH cannot
 override, hence LD_PRELOAD (the shims carry NVIDIA's sonames, so the real
@@ -110,7 +113,7 @@ def main():
         samples = [s for s in samples if s.stem in args.only]
     shim = Path(args.shim_dir)
     preload = ":".join(str(shim / name) for name in ("libcudart.so.12", "libcublas.so.12", "libcublasLt.so.12",
-                                                     "libcuda.so.1"))
+                                                     "libcudnn.so.9", "libcuda.so.1"))
     hide_gpu = not args.keep_gpu
     if hide_gpu and subprocess.run(without_gpu(["true"]), capture_output=True).returncode != 0:
         raise SystemExit("cannot hide the GPU (unprivileged user namespaces unavailable); use --keep-gpu")
@@ -121,7 +124,8 @@ def main():
         tmp = Path(tmp_name)
         config = {"listen_port": 0, "log_level": "info", "cuda": {
             "runtime_library": str(nvidia_lib_dir(args.python, "cuda_runtime") / "libcudart.so.12"),
-            "cublas_library": str(nvidia_lib_dir(args.python, "cublas") / "libcublas.so.12")}}
+            "cublas_library": str(nvidia_lib_dir(args.python, "cublas") / "libcublas.so.12"),
+            "cudnn_library": str(nvidia_lib_dir(args.python, "cudnn") / "libcudnn.so.9")}}
         tuna_env = dict(base_env, LD_PRELOAD=preload)
         if args.mtls:
             pki = tmp / "pki"

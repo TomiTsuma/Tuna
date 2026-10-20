@@ -23,6 +23,10 @@
 // Scalars are read from host or device memory according to the pointer mode,
 // so the remoting of both modes is checked by the results.
 //
+// With cuDNN headers (TUNA_CUDA_HAVE_CUDNN) it also models a small cuDNN:
+// spatial batch norm and a backend API that runs a single-convolution graph
+// on the host (see the cuDNN section at the end of the file).
+//
 // It is linked into tuna_cuda_tests (in-process) and also built as a shared
 // library that tuna_server loads in place of libcudart: it exports only
 // tuna_cuda_resolve, which backend_real.cpp uses as its symbol source.
@@ -35,11 +39,15 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #endif
+#ifdef TUNA_CUDA_HAVE_CUDNN
+#include <cudnn.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <map>
 #include <string>
 #include <vector>
@@ -960,6 +968,590 @@ cublasStatus_t LtMatmul(cublasLtHandle_t handle, cublasLtMatmulDesc_t desc_id, c
 
 #endif  // TUNA_CUDA_HAVE_CUBLAS
 
+#ifdef TUNA_CUDA_HAVE_CUDNN
+// ------------------------------------------------------------------- cuDNN
+//
+// A small cuDNN: handles with a stream, legacy tensor descriptors, spatial
+// batch norm (forward training, backward, inference) on float NCHW tensors,
+// and a backend API that stores attributes generically and runs one graph
+// shape, a single 2-D convolution forward, on the host. That is enough to
+// check the descriptor translation end to end: tensors, the convolution, the
+// operation, the graph, heuristic results copied into caller-created engine
+// configs, the plan and a variant pack all have to reach the "library" as
+// the right objects for the convolution to come out right.
+
+struct DnnTensor {
+    bool set = false;
+    cudnnDataType_t type = CUDNN_DATA_FLOAT;
+    int nb = 0;
+    int dims[CUDNN_DIM_MAX] = {};
+    int strides[CUDNN_DIM_MAX] = {};
+};
+
+struct DnnAttr {
+    cudnnBackendAttributeType_t type;
+    int64_t count = 0;
+    std::vector<char> bytes;
+};
+
+struct DnnDesc {
+    cudnnBackendDescriptorType_t type;
+    bool finalized = false;
+    std::map<int, DnnAttr> attrs;
+};
+
+struct MockDnn {
+    std::map<uint64_t, uint64_t> handles;  // -> stream
+    std::map<uint64_t, DnnTensor> tensors;
+    std::map<uint64_t, DnnDesc> descs;
+    std::string last_error;
+};
+MockDnn gd;
+
+cudnnStatus_t DnnFail(cudnnStatus_t status, const char* message) {
+    gd.last_error = message;
+    return status;
+}
+
+size_t DnnElementSize(cudnnBackendAttributeType_t type) {
+    switch (type) {
+    case CUDNN_TYPE_HANDLE:
+    case CUDNN_TYPE_INT64:
+    case CUDNN_TYPE_DOUBLE:
+    case CUDNN_TYPE_VOID_PTR:
+    case CUDNN_TYPE_BACKEND_DESCRIPTOR: return 8;
+    case CUDNN_TYPE_BOOLEAN: return 1;
+    case CUDNN_TYPE_DATA_TYPE:
+    case CUDNN_TYPE_FLOAT:
+    case CUDNN_TYPE_CONVOLUTION_MODE:
+    case CUDNN_TYPE_HEUR_MODE:
+    case CUDNN_TYPE_INT32: return 4;
+    default: return 0;
+    }
+}
+
+DnnDesc* DnnFind(const void* p) {
+    auto it = gd.descs.find(reinterpret_cast<uint64_t>(p));
+    return it == gd.descs.end() ? nullptr : &it->second;
+}
+
+const DnnAttr* DnnGet(const DnnDesc& d, int name, cudnnBackendAttributeType_t type) {
+    auto it = d.attrs.find(name);
+    return it != d.attrs.end() && it->second.type == type ? &it->second : nullptr;
+}
+
+template <typename T>
+std::vector<T> DnnValues(const DnnDesc& d, int name, cudnnBackendAttributeType_t type) {
+    const DnnAttr* a = DnnGet(d, name, type);
+    std::vector<T> values;
+    if (a) {
+        values.resize(static_cast<size_t>(a->count));
+        std::memcpy(values.data(), a->bytes.data(), a->bytes.size());
+    }
+    return values;
+}
+
+// The descriptor a single-element descriptor attribute refers to.
+DnnDesc* DnnRef(const DnnDesc& d, int name) {
+    auto refs = DnnValues<void*>(d, name, CUDNN_TYPE_BACKEND_DESCRIPTOR);
+    return refs.size() == 1 ? DnnFind(refs[0]) : nullptr;
+}
+
+void DnnPut(DnnDesc& d, int name, cudnnBackendAttributeType_t type, const void* values, int64_t count) {
+    DnnAttr& a = d.attrs[name];
+    a.type = type;
+    a.count = count;
+    a.bytes.assign(static_cast<const char*>(values),
+                   static_cast<const char*>(values) + DnnElementSize(type) * static_cast<size_t>(count));
+}
+
+uint64_t DnnNewDesc(cudnnBackendDescriptorType_t type) {
+    const uint64_t id = g.next_handle++;
+    gd.descs[id].type = type;
+    return id;
+}
+
+cudnnStatus_t DnnCreate(cudnnHandle_t* handle) {
+    const uint64_t h = g.next_handle++;
+    gd.handles[h] = 0;
+    *handle = reinterpret_cast<cudnnHandle_t>(h);
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t DnnDestroy(cudnnHandle_t handle) {
+    return gd.handles.erase(reinterpret_cast<uint64_t>(handle)) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_BAD_PARAM;
+}
+
+bool DnnHandleKnown(const void* handle) { return gd.handles.count(reinterpret_cast<uint64_t>(handle)) != 0; }
+
+cudnnStatus_t DnnSetStream(cudnnHandle_t handle, cudaStream_t stream) {
+    auto it = gd.handles.find(reinterpret_cast<uint64_t>(handle));
+    if (it == gd.handles.end()) return CUDNN_STATUS_BAD_PARAM;
+    it->second = reinterpret_cast<uint64_t>(stream);
+    return CUDNN_STATUS_SUCCESS;
+}
+
+size_t DnnGetVersion() { return 91002; }
+size_t DnnGetMaxDeviceVersion() { return 1200; }
+size_t DnnGetCudartVersion() { return 12080; }
+
+void DnnGetLastErrorString(char* message, size_t max_size) {
+    std::snprintf(message, max_size, "mock: %s", gd.last_error.c_str());
+}
+
+cudnnStatus_t DnnCreateTensor(cudnnTensorDescriptor_t* desc) {
+    const uint64_t id = g.next_handle++;
+    gd.tensors[id] = DnnTensor{};
+    *desc = reinterpret_cast<cudnnTensorDescriptor_t>(id);
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t DnnSetTensorNd(cudnnTensorDescriptor_t desc, cudnnDataType_t type, int nb, const int* dims,
+                             const int* strides) {
+    auto it = gd.tensors.find(reinterpret_cast<uint64_t>(desc));
+    if (it == gd.tensors.end() || nb < 1 || nb > CUDNN_DIM_MAX) return CUDNN_STATUS_BAD_PARAM;
+    DnnTensor& t = it->second;
+    t.set = true;
+    t.type = type;
+    t.nb = nb;
+    std::copy(dims, dims + nb, t.dims);
+    std::copy(strides, strides + nb, t.strides);
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t DnnDestroyTensor(cudnnTensorDescriptor_t desc) {
+    return gd.tensors.erase(reinterpret_cast<uint64_t>(desc)) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_BAD_PARAM;
+}
+
+const DnnTensor* DnnTensorOf(const void* desc) {
+    auto it = gd.tensors.find(reinterpret_cast<uint64_t>(desc));
+    return it != gd.tensors.end() && it->second.set ? &it->second : nullptr;
+}
+
+// A float NCHW tensor; nullptr unless the descriptor is one.
+const DnnTensor* DnnNchw(const void* desc) {
+    const DnnTensor* t = DnnTensorOf(desc);
+    return t && t->nb == 4 && t->type == CUDNN_DATA_FLOAT ? t : nullptr;
+}
+
+size_t DnnSpan(const DnnTensor& t) {  // elements from the first to the last one, plus one
+    size_t span = 1;
+    for (int i = 0; i < t.nb; ++i) span += static_cast<size_t>(t.dims[i] - 1) * static_cast<size_t>(t.strides[i]);
+    return span;
+}
+
+size_t DnnAt(const DnnTensor& t, int n, int c, int h, int w) {
+    return static_cast<size_t>(n) * t.strides[0] + static_cast<size_t>(c) * t.strides[1] +
+           static_cast<size_t>(h) * t.strides[2] + static_cast<size_t>(w) * t.strides[3];
+}
+
+// Batch-norm sizes: made up, but distinct per query and per channel count.
+cudnnStatus_t DnnBnSize(const void* x_desc, size_t per_channel, size_t* size) {
+    ++g.stats.dnn_size_queries;
+    const DnnTensor* x = DnnNchw(x_desc);
+    if (!x) return DnnFail(CUDNN_STATUS_BAD_PARAM, "batch norm needs a float NCHW x");
+    *size = per_channel * static_cast<size_t>(x->dims[1]);
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t DnnBnFwdWorkspace(cudnnHandle_t handle, cudnnBatchNormMode_t, cudnnBatchNormOps_t,
+                                cudnnTensorDescriptor_t x, cudnnTensorDescriptor_t, cudnnTensorDescriptor_t,
+                                cudnnTensorDescriptor_t, cudnnActivationDescriptor_t act, size_t* size) {
+    if (!DnnHandleKnown(handle) || act) return CUDNN_STATUS_BAD_PARAM;
+    return DnnBnSize(x, 32, size);
+}
+
+cudnnStatus_t DnnBnBwdWorkspace(cudnnHandle_t handle, cudnnBatchNormMode_t, cudnnBatchNormOps_t,
+                                cudnnTensorDescriptor_t x, cudnnTensorDescriptor_t, cudnnTensorDescriptor_t,
+                                cudnnTensorDescriptor_t, cudnnTensorDescriptor_t, cudnnTensorDescriptor_t,
+                                cudnnActivationDescriptor_t act, size_t* size) {
+    if (!DnnHandleKnown(handle) || act) return CUDNN_STATUS_BAD_PARAM;
+    return DnnBnSize(x, 48, size);
+}
+
+cudnnStatus_t DnnBnReserve(cudnnHandle_t handle, cudnnBatchNormMode_t, cudnnBatchNormOps_t,
+                           cudnnActivationDescriptor_t act, cudnnTensorDescriptor_t x, size_t* size) {
+    if (!DnnHandleKnown(handle) || act) return CUDNN_STATUS_BAD_PARAM;
+    return DnnBnSize(x, 16, size);
+}
+
+// Workspace / reserve buffers must be device memory of at least the size given.
+bool DnnBuffer(const void* p, size_t size) { return size == 0 || Find(reinterpret_cast<uint64_t>(p), size); }
+
+struct DnnBnShape {
+    const DnnTensor* x;
+    int n, c, h, w;
+    double m;  // elements per channel
+};
+
+bool DnnBnCheck(const void* x_desc, const void* y_desc, const void* bn_desc, DnnBnShape* shape) {
+    const DnnTensor* x = DnnNchw(x_desc);
+    const DnnTensor* y = DnnNchw(y_desc);
+    const DnnTensor* bn = DnnNchw(bn_desc);
+    if (!x || !y || !bn || bn->dims[1] != x->dims[1]) return false;
+    for (int i = 0; i < 4; ++i) {
+        if (x->dims[i] != y->dims[i] || x->strides[i] != y->strides[i]) return false;
+    }
+    *shape = {x, x->dims[0], x->dims[1], x->dims[2], x->dims[3],
+              static_cast<double>(x->dims[0]) * x->dims[2] * x->dims[3]};
+    return true;
+}
+
+cudnnStatus_t DnnBnForwardTraining(cudnnHandle_t handle, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t ops,
+                                   const void* alpha_p, const void* beta_p, cudnnTensorDescriptor_t x_desc,
+                                   const void* x_p, cudnnTensorDescriptor_t z_desc, const void*,
+                                   cudnnTensorDescriptor_t y_desc, void* y_p, cudnnTensorDescriptor_t bn_desc,
+                                   const void* scale_p, const void* bias_p, double factor, void* rmean_p,
+                                   void* rvar_p, double epsilon, void* smean_p, void* sinv_p,
+                                   cudnnActivationDescriptor_t act, void* ws, size_t ws_size, void* reserve,
+                                   size_t reserve_size) {
+    DnnBnShape s;
+    if (!DnnHandleKnown(handle) || mode != CUDNN_BATCHNORM_SPATIAL || ops != CUDNN_BATCHNORM_OPS_BN || z_desc ||
+        act || !DnnBnCheck(x_desc, y_desc, bn_desc, &s) || !DnnBuffer(ws, ws_size) ||
+        !DnnBuffer(reserve, reserve_size)) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "bad batch-norm forward arguments");
+    }
+    const size_t span = DnnSpan(*s.x);
+    const float* x = Device<float>(reinterpret_cast<uint64_t>(x_p), span);
+    float* y = Device<float>(reinterpret_cast<uint64_t>(y_p), span);
+    const float* scale = Device<float>(reinterpret_cast<uint64_t>(scale_p), s.c);
+    const float* bias = Device<float>(reinterpret_cast<uint64_t>(bias_p), s.c);
+    float* rmean = rmean_p ? Device<float>(reinterpret_cast<uint64_t>(rmean_p), s.c) : nullptr;
+    float* rvar = rvar_p ? Device<float>(reinterpret_cast<uint64_t>(rvar_p), s.c) : nullptr;
+    float* smean = smean_p ? Device<float>(reinterpret_cast<uint64_t>(smean_p), s.c) : nullptr;
+    float* sinv = sinv_p ? Device<float>(reinterpret_cast<uint64_t>(sinv_p), s.c) : nullptr;
+    if (!x || !y || !scale || !bias || (rmean_p && !rmean) || (rvar_p && !rvar) || (smean_p && !smean) ||
+        (sinv_p && !sinv)) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "batch-norm pointer outside device memory");
+    }
+    const float alpha = *static_cast<const float*>(alpha_p), beta = *static_cast<const float*>(beta_p);
+    for (int c = 0; c < s.c; ++c) {
+        double sum = 0, sq = 0;
+        for (int n = 0; n < s.n; ++n)
+            for (int h = 0; h < s.h; ++h)
+                for (int w = 0; w < s.w; ++w) {
+                    const double v = x[DnnAt(*s.x, n, c, h, w)];
+                    sum += v;
+                    sq += v * v;
+                }
+        const double mean = sum / s.m, var = sq / s.m - mean * mean;
+        const double inv = 1.0 / std::sqrt(var + epsilon);
+        for (int n = 0; n < s.n; ++n)
+            for (int h = 0; h < s.h; ++h)
+                for (int w = 0; w < s.w; ++w) {
+                    const size_t i = DnnAt(*s.x, n, c, h, w);
+                    const double out = scale[c] * (x[i] - mean) * inv + bias[c];
+                    y[i] = static_cast<float>(alpha * out + beta * y[i]);
+                }
+        if (rmean) rmean[c] = static_cast<float>((1 - factor) * rmean[c] + factor * mean);
+        if (rvar) rvar[c] = static_cast<float>((1 - factor) * rvar[c] + factor * var * s.m / (s.m - 1));
+        if (smean) smean[c] = static_cast<float>(mean);
+        if (sinv) sinv[c] = static_cast<float>(inv);
+    }
+    ++g.stats.dnn_executes;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t DnnBnBackward(cudnnHandle_t handle, cudnnBatchNormMode_t mode, cudnnBatchNormOps_t ops,
+                            const void* alpha_data_p, const void* beta_data_p, const void* alpha_param_p,
+                            const void* beta_param_p, cudnnTensorDescriptor_t x_desc, const void* x_p,
+                            cudnnTensorDescriptor_t, const void*, cudnnTensorDescriptor_t dy_desc, const void* dy_p,
+                            cudnnTensorDescriptor_t dz_desc, void*, cudnnTensorDescriptor_t dx_desc, void* dx_p,
+                            cudnnTensorDescriptor_t dbn_desc, const void* scale_p, const void*, void* dscale_p,
+                            void* dbias_p, double, const void* smean_p, const void* sinv_p,
+                            cudnnActivationDescriptor_t act, void* ws, size_t ws_size, void* reserve,
+                            size_t reserve_size) {
+    DnnBnShape s, sdx;
+    if (!DnnHandleKnown(handle) || mode != CUDNN_BATCHNORM_SPATIAL || ops != CUDNN_BATCHNORM_OPS_BN || dz_desc ||
+        act || !DnnBnCheck(x_desc, dy_desc, dbn_desc, &s) || !DnnBnCheck(x_desc, dx_desc, dbn_desc, &sdx) ||
+        !smean_p || !sinv_p || !DnnBuffer(ws, ws_size) || !DnnBuffer(reserve, reserve_size)) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "bad batch-norm backward arguments");
+    }
+    const size_t span = DnnSpan(*s.x);
+    const float* x = Device<float>(reinterpret_cast<uint64_t>(x_p), span);
+    const float* dy = Device<float>(reinterpret_cast<uint64_t>(dy_p), span);
+    float* dx = Device<float>(reinterpret_cast<uint64_t>(dx_p), span);
+    const float* scale = Device<float>(reinterpret_cast<uint64_t>(scale_p), s.c);
+    float* dscale = Device<float>(reinterpret_cast<uint64_t>(dscale_p), s.c);
+    float* dbias = Device<float>(reinterpret_cast<uint64_t>(dbias_p), s.c);
+    const float* smean = Device<float>(reinterpret_cast<uint64_t>(smean_p), s.c);
+    const float* sinv = Device<float>(reinterpret_cast<uint64_t>(sinv_p), s.c);
+    if (!x || !dy || !dx || !scale || !dscale || !dbias || !smean || !sinv) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "batch-norm pointer outside device memory");
+    }
+    const float ad = *static_cast<const float*>(alpha_data_p), bd = *static_cast<const float*>(beta_data_p);
+    const float ap = *static_cast<const float*>(alpha_param_p), bp = *static_cast<const float*>(beta_param_p);
+    for (int c = 0; c < s.c; ++c) {
+        double gsum = 0, gxhat = 0;
+        for (int n = 0; n < s.n; ++n)
+            for (int h = 0; h < s.h; ++h)
+                for (int w = 0; w < s.w; ++w) {
+                    const size_t i = DnnAt(*s.x, n, c, h, w);
+                    gsum += dy[i];
+                    gxhat += dy[i] * (x[i] - smean[c]) * sinv[c];
+                }
+        for (int n = 0; n < s.n; ++n)
+            for (int h = 0; h < s.h; ++h)
+                for (int w = 0; w < s.w; ++w) {
+                    const size_t i = DnnAt(*s.x, n, c, h, w);
+                    const double xhat = (x[i] - smean[c]) * sinv[c];
+                    const double g = scale[c] * sinv[c] / s.m * (s.m * dy[i] - gsum - xhat * gxhat);
+                    dx[i] = static_cast<float>(ad * g + bd * dx[i]);
+                }
+        dscale[c] = static_cast<float>(ap * gxhat + bp * dscale[c]);
+        dbias[c] = static_cast<float>(ap * gsum + bp * dbias[c]);
+    }
+    ++g.stats.dnn_executes;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t DnnBnInference(cudnnHandle_t handle, cudnnBatchNormMode_t mode, const void* alpha_p,
+                             const void* beta_p, cudnnTensorDescriptor_t x_desc, const void* x_p,
+                             cudnnTensorDescriptor_t y_desc, void* y_p, cudnnTensorDescriptor_t bn_desc,
+                             const void* scale_p, const void* bias_p, const void* mean_p, const void* var_p,
+                             double epsilon) {
+    DnnBnShape s;
+    if (!DnnHandleKnown(handle) || mode != CUDNN_BATCHNORM_SPATIAL || !DnnBnCheck(x_desc, y_desc, bn_desc, &s)) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "bad batch-norm inference arguments");
+    }
+    const size_t span = DnnSpan(*s.x);
+    const float* x = Device<float>(reinterpret_cast<uint64_t>(x_p), span);
+    float* y = Device<float>(reinterpret_cast<uint64_t>(y_p), span);
+    const float* scale = Device<float>(reinterpret_cast<uint64_t>(scale_p), s.c);
+    const float* bias = Device<float>(reinterpret_cast<uint64_t>(bias_p), s.c);
+    const float* mean = Device<float>(reinterpret_cast<uint64_t>(mean_p), s.c);
+    const float* var = Device<float>(reinterpret_cast<uint64_t>(var_p), s.c);
+    if (!x || !y || !scale || !bias || !mean || !var) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "batch-norm pointer outside device memory");
+    }
+    const float alpha = *static_cast<const float*>(alpha_p), beta = *static_cast<const float*>(beta_p);
+    for (int c = 0; c < s.c; ++c) {
+        const double inv = 1.0 / std::sqrt(var[c] + epsilon);
+        for (int n = 0; n < s.n; ++n)
+            for (int h = 0; h < s.h; ++h)
+                for (int w = 0; w < s.w; ++w) {
+                    const size_t i = DnnAt(*s.x, n, c, h, w);
+                    y[i] = static_cast<float>(alpha * (scale[c] * (x[i] - mean[c]) * inv + bias[c]) + beta * y[i]);
+                }
+    }
+    ++g.stats.dnn_executes;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+// --- backend API
+
+cudnnStatus_t DnnBackendCreate(cudnnBackendDescriptorType_t type, cudnnBackendDescriptor_t* desc) {
+    *desc = reinterpret_cast<cudnnBackendDescriptor_t>(DnnNewDesc(type));
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t DnnBackendDestroy(cudnnBackendDescriptor_t desc) {
+    return gd.descs.erase(reinterpret_cast<uint64_t>(desc)) ? CUDNN_STATUS_SUCCESS : CUDNN_STATUS_BAD_PARAM;
+}
+
+cudnnStatus_t DnnBackendSet(cudnnBackendDescriptor_t desc, cudnnBackendAttributeName_t name,
+                            cudnnBackendAttributeType_t type, int64_t count, const void* elements) {
+    DnnDesc* d = DnnFind(desc);
+    if (!d) return DnnFail(CUDNN_STATUS_BAD_PARAM, "set on an unknown descriptor");
+    if (DnnElementSize(type) == 0) return DnnFail(CUDNN_STATUS_NOT_SUPPORTED, "attribute type not modelled");
+    if (count < 0 || (count > 0 && !elements)) return DnnFail(CUDNN_STATUS_BAD_PARAM, "bad element count");
+    // Pointer-typed elements must be what they claim, which checks Tuna's translation.
+    const bool pointers = type == CUDNN_TYPE_BACKEND_DESCRIPTOR || type == CUDNN_TYPE_HANDLE;
+    for (int64_t i = 0; pointers && i < count; ++i) {
+        const void* p = static_cast<void* const*>(elements)[i];
+        if (type == CUDNN_TYPE_BACKEND_DESCRIPTOR && !DnnFind(p)) {
+            return DnnFail(CUDNN_STATUS_BAD_PARAM, "descriptor element is not a descriptor");
+        }
+        if (type == CUDNN_TYPE_HANDLE && !DnnHandleKnown(p)) return DnnFail(CUDNN_STATUS_BAD_PARAM, "bad handle");
+    }
+    DnnPut(*d, name, type, elements, count);
+    return CUDNN_STATUS_SUCCESS;
+}
+
+// The convolution forward operation a plan runs, or nullptr.
+DnnDesc* DnnPlanOperation(const DnnDesc& plan) {
+    DnnDesc* cfg = DnnRef(plan, CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG);
+    DnnDesc* engine = cfg ? DnnRef(*cfg, CUDNN_ATTR_ENGINECFG_ENGINE) : nullptr;
+    DnnDesc* graph = engine ? DnnRef(*engine, CUDNN_ATTR_ENGINE_OPERATION_GRAPH) : nullptr;
+    if (!graph) return nullptr;
+    auto ops = DnnValues<void*>(*graph, CUDNN_ATTR_OPERATIONGRAPH_OPS, CUDNN_TYPE_BACKEND_DESCRIPTOR);
+    DnnDesc* op = ops.size() == 1 ? DnnFind(ops[0]) : nullptr;
+    return op && op->type == CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR ? op : nullptr;
+}
+
+constexpr int64_t kDnnPlanWorkspace = 256;
+
+cudnnStatus_t DnnBackendFinalize(cudnnBackendDescriptor_t desc) {
+    DnnDesc* d = DnnFind(desc);
+    if (!d) return DnnFail(CUDNN_STATUS_BAD_PARAM, "finalize of an unknown descriptor");
+    auto has = [&](std::initializer_list<int> names) {
+        return std::all_of(names.begin(), names.end(), [&](int n) { return d->attrs.count(n) != 0; });
+    };
+    bool ok = true;
+    switch (d->type) {
+    case CUDNN_BACKEND_TENSOR_DESCRIPTOR:
+        ok = has({CUDNN_ATTR_TENSOR_DATA_TYPE, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_ATTR_TENSOR_STRIDES,
+                  CUDNN_ATTR_TENSOR_UNIQUE_ID});
+        break;
+    case CUDNN_BACKEND_CONVOLUTION_DESCRIPTOR:
+        ok = has({CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS, CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES,
+                  CUDNN_ATTR_CONVOLUTION_DILATIONS});
+        break;
+    case CUDNN_BACKEND_OPERATION_CONVOLUTION_FORWARD_DESCRIPTOR:
+        ok = DnnRef(*d, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X) &&
+             DnnRef(*d, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W) &&
+             DnnRef(*d, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y) &&
+             DnnRef(*d, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC);
+        break;
+    case CUDNN_BACKEND_OPERATIONGRAPH_DESCRIPTOR:
+        ok = has({CUDNN_ATTR_OPERATIONGRAPH_HANDLE, CUDNN_ATTR_OPERATIONGRAPH_OPS});
+        break;
+    case CUDNN_BACKEND_ENGINEHEUR_DESCRIPTOR: {
+        // Two "engines" for the graph, each wrapped in an engine config: the
+        // results a caller reads back into descriptors it created itself.
+        DnnDesc* graph = DnnRef(*d, CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH);
+        if (!graph || !d->attrs.count(CUDNN_ATTR_ENGINEHEUR_MODE)) {
+            ok = false;
+            break;
+        }
+        void* graph_ptr = DnnValues<void*>(*d, CUDNN_ATTR_ENGINEHEUR_OPERATION_GRAPH,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR)[0];
+        std::vector<void*> results;
+        for (int64_t i = 0; i < 2; ++i) {
+            const uint64_t engine = DnnNewDesc(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+            DnnPut(gd.descs[engine], CUDNN_ATTR_ENGINE_OPERATION_GRAPH, CUDNN_TYPE_BACKEND_DESCRIPTOR, &graph_ptr, 1);
+            DnnPut(gd.descs[engine], CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, &i, 1);
+            gd.descs[engine].finalized = true;
+            const uint64_t cfg = DnnNewDesc(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR);
+            void* engine_ptr = reinterpret_cast<void*>(engine);
+            DnnPut(gd.descs[cfg], CUDNN_ATTR_ENGINECFG_ENGINE, CUDNN_TYPE_BACKEND_DESCRIPTOR, &engine_ptr, 1);
+            gd.descs[cfg].finalized = true;
+            results.push_back(reinterpret_cast<void*>(cfg));
+        }
+        d = DnnFind(desc);  // gd.descs grew; std::map keeps references stable, but be explicit
+        DnnPut(*d, CUDNN_ATTR_ENGINEHEUR_RESULTS, CUDNN_TYPE_BACKEND_DESCRIPTOR, results.data(),
+               static_cast<int64_t>(results.size()));
+        break;
+    }
+    case CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR:
+        ok = has({CUDNN_ATTR_EXECUTION_PLAN_HANDLE}) && DnnPlanOperation(*d);
+        if (ok) DnnPut(*d, CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE, CUDNN_TYPE_INT64, &kDnnPlanWorkspace, 1);
+        break;
+    case CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR: {
+        auto ids = DnnValues<int64_t>(*d, CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, CUDNN_TYPE_INT64);
+        auto ptrs = DnnValues<void*>(*d, CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, CUDNN_TYPE_VOID_PTR);
+        ok = !ids.empty() && ids.size() == ptrs.size();
+        break;
+    }
+    default: break;
+    }
+    if (!ok) return DnnFail(CUDNN_STATUS_BAD_PARAM, "finalize: required attributes missing");
+    d->finalized = true;
+    ++g.stats.dnn_finalizes;
+    return CUDNN_STATUS_SUCCESS;
+}
+
+cudnnStatus_t DnnBackendGet(cudnnBackendDescriptor_t desc, cudnnBackendAttributeName_t name,
+                            cudnnBackendAttributeType_t type, int64_t requested, int64_t* count, void* elements) {
+    DnnDesc* d = DnnFind(desc);
+    if (!d || !count) return DnnFail(CUDNN_STATUS_BAD_PARAM, "get on an unknown descriptor");
+    auto it = d->attrs.find(name);
+    if (it == d->attrs.end()) return DnnFail(CUDNN_STATUS_BAD_PARAM, "attribute not set");
+    const DnnAttr a = it->second;  // a copy: filling descriptors below may touch gd.descs
+    if (a.type != type) return DnnFail(CUDNN_STATUS_BAD_PARAM_ATTRIBUTE_TYPE, "attribute type mismatch");
+    *count = a.count;
+    if (!elements) return CUDNN_STATUS_SUCCESS;
+    const int64_t n = std::min(requested, a.count);
+    if (type == CUDNN_TYPE_BACKEND_DESCRIPTOR) {
+        // cuDNN copies each result into the descriptor the caller passed in.
+        for (int64_t i = 0; i < n; ++i) {
+            void* source = nullptr;
+            std::memcpy(&source, a.bytes.data() + 8 * i, 8);
+            DnnDesc* from = DnnFind(source);
+            DnnDesc* to = DnnFind(static_cast<void**>(elements)[i]);
+            if (!from || !to || from->type != to->type) {
+                return DnnFail(CUDNN_STATUS_BAD_PARAM, "output descriptor of the wrong type");
+            }
+            *to = *from;
+        }
+    } else {
+        std::memcpy(elements, a.bytes.data(), DnnElementSize(type) * static_cast<size_t>(n));
+    }
+    return CUDNN_STATUS_SUCCESS;
+}
+
+// Runs the plan's convolution (cross-correlation, NCHW float, 2-D) on the host.
+cudnnStatus_t DnnBackendExecute(cudnnHandle_t handle, cudnnBackendDescriptor_t plan_p, cudnnBackendDescriptor_t pack_p) {
+    DnnDesc* plan = DnnFind(plan_p);
+    DnnDesc* pack = DnnFind(pack_p);
+    if (!DnnHandleKnown(handle) || !plan || !pack || !plan->finalized || !pack->finalized ||
+        plan->type != CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR || pack->type != CUDNN_BACKEND_VARIANT_PACK_DESCRIPTOR) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "execute needs a finalized plan and variant pack");
+    }
+    DnnDesc* op = DnnPlanOperation(*plan);
+    DnnDesc* conv = DnnRef(*op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_CONV_DESC);
+    auto ids = DnnValues<int64_t>(*pack, CUDNN_ATTR_VARIANT_PACK_UNIQUE_IDS, CUDNN_TYPE_INT64);
+    auto ptrs = DnnValues<void*>(*pack, CUDNN_ATTR_VARIANT_PACK_DATA_POINTERS, CUDNN_TYPE_VOID_PTR);
+    auto workspace = DnnValues<void*>(*pack, CUDNN_ATTR_VARIANT_PACK_WORKSPACE, CUDNN_TYPE_VOID_PTR);
+    if (workspace.size() != 1 || !Find(reinterpret_cast<uint64_t>(workspace[0]), kDnnPlanWorkspace)) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "workspace missing or too small");
+    }
+    struct View {
+        std::vector<int64_t> dims, strides;
+        float* data = nullptr;
+    };
+    auto view = [&](int name, View* v) {
+        DnnDesc* t = DnnRef(*op, name);
+        if (!t) return false;
+        v->dims = DnnValues<int64_t>(*t, CUDNN_ATTR_TENSOR_DIMENSIONS, CUDNN_TYPE_INT64);
+        v->strides = DnnValues<int64_t>(*t, CUDNN_ATTR_TENSOR_STRIDES, CUDNN_TYPE_INT64);
+        auto uid = DnnValues<int64_t>(*t, CUDNN_ATTR_TENSOR_UNIQUE_ID, CUDNN_TYPE_INT64);
+        if (v->dims.size() != 4 || v->strides.size() != 4 || uid.size() != 1) return false;
+        auto at = std::find(ids.begin(), ids.end(), uid[0]);
+        if (at == ids.end()) return false;
+        size_t span = 1;
+        for (int i = 0; i < 4; ++i) span += static_cast<size_t>((v->dims[i] - 1) * v->strides[i]);
+        v->data = Device<float>(reinterpret_cast<uint64_t>(ptrs[static_cast<size_t>(at - ids.begin())]), span);
+        return v->data != nullptr;
+    };
+    View x, w, y;
+    if (!view(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_X, &x) || !view(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_W, &w) ||
+        !view(CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_Y, &y) || !conv) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "variant pack does not cover the graph's tensors");
+    }
+    auto pad = DnnValues<int64_t>(*conv, CUDNN_ATTR_CONVOLUTION_PRE_PADDINGS, CUDNN_TYPE_INT64);
+    auto stride = DnnValues<int64_t>(*conv, CUDNN_ATTR_CONVOLUTION_FILTER_STRIDES, CUDNN_TYPE_INT64);
+    auto dilation = DnnValues<int64_t>(*conv, CUDNN_ATTR_CONVOLUTION_DILATIONS, CUDNN_TYPE_INT64);
+    auto alpha = DnnValues<float>(*op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_ALPHA, CUDNN_TYPE_FLOAT);
+    auto beta = DnnValues<float>(*op, CUDNN_ATTR_OPERATION_CONVOLUTION_FORWARD_BETA, CUDNN_TYPE_FLOAT);
+    if (pad.size() != 2 || stride.size() != 2 || dilation.size() != 2) {
+        return DnnFail(CUDNN_STATUS_BAD_PARAM, "2-D convolutions only");
+    }
+    const float a = alpha.empty() ? 1.0f : alpha[0], b = beta.empty() ? 0.0f : beta[0];
+    auto at = [](const View& v, int64_t n, int64_t c, int64_t h, int64_t wi) {
+        return n * v.strides[0] + c * v.strides[1] + h * v.strides[2] + wi * v.strides[3];
+    };
+    for (int64_t n = 0; n < y.dims[0]; ++n)
+        for (int64_t k = 0; k < y.dims[1]; ++k)
+            for (int64_t p = 0; p < y.dims[2]; ++p)
+                for (int64_t q = 0; q < y.dims[3]; ++q) {
+                    double sum = 0;
+                    for (int64_t c = 0; c < x.dims[1]; ++c)
+                        for (int64_t r = 0; r < w.dims[2]; ++r)
+                            for (int64_t s = 0; s < w.dims[3]; ++s) {
+                                const int64_t ih = p * stride[0] - pad[0] + r * dilation[0];
+                                const int64_t iw = q * stride[1] - pad[1] + s * dilation[1];
+                                if (ih < 0 || iw < 0 || ih >= x.dims[2] || iw >= x.dims[3]) continue;
+                                sum += x.data[at(x, n, c, ih, iw)] * w.data[at(w, k, c, r, s)];
+                            }
+                    float& out = y.data[at(y, n, k, p, q)];
+                    out = static_cast<float>(a * sum + b * out);
+                }
+    ++g.stats.dnn_executes;
+    return CUDNN_STATUS_SUCCESS;
+}
+#endif  // TUNA_CUDA_HAVE_CUDNN
+
 struct Entry {
     const char* name;
     void* fn;
@@ -1051,6 +1643,30 @@ const Entry kEntries[] = {
     TUNA_MOCK("cublasLtMatmulAlgoGetHeuristic", LtHeuristic),
     TUNA_MOCK("cublasLtMatmul", LtMatmul),
 #endif
+#ifdef TUNA_CUDA_HAVE_CUDNN
+    TUNA_MOCK("cudnnCreate", DnnCreate),
+    TUNA_MOCK("cudnnDestroy", DnnDestroy),
+    TUNA_MOCK("cudnnSetStream", DnnSetStream),
+    TUNA_MOCK("cudnnGetVersion", DnnGetVersion),
+    TUNA_MOCK("cudnnGetMaxDeviceVersion", DnnGetMaxDeviceVersion),
+    TUNA_MOCK("cudnnGetCudartVersion", DnnGetCudartVersion),
+    TUNA_MOCK("cudnnGetLastErrorString", DnnGetLastErrorString),
+    TUNA_MOCK("cudnnCreateTensorDescriptor", DnnCreateTensor),
+    TUNA_MOCK("cudnnSetTensorNdDescriptor", DnnSetTensorNd),
+    TUNA_MOCK("cudnnDestroyTensorDescriptor", DnnDestroyTensor),
+    TUNA_MOCK("cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize", DnnBnFwdWorkspace),
+    TUNA_MOCK("cudnnGetBatchNormalizationBackwardExWorkspaceSize", DnnBnBwdWorkspace),
+    TUNA_MOCK("cudnnGetBatchNormalizationTrainingExReserveSpaceSize", DnnBnReserve),
+    TUNA_MOCK("cudnnBatchNormalizationForwardTrainingEx", DnnBnForwardTraining),
+    TUNA_MOCK("cudnnBatchNormalizationBackwardEx", DnnBnBackward),
+    TUNA_MOCK("cudnnBatchNormalizationForwardInference", DnnBnInference),
+    TUNA_MOCK("cudnnBackendCreateDescriptor", DnnBackendCreate),
+    TUNA_MOCK("cudnnBackendDestroyDescriptor", DnnBackendDestroy),
+    TUNA_MOCK("cudnnBackendSetAttribute", DnnBackendSet),
+    TUNA_MOCK("cudnnBackendGetAttribute", DnnBackendGet),
+    TUNA_MOCK("cudnnBackendFinalize", DnnBackendFinalize),
+    TUNA_MOCK("cudnnBackendExecute", DnnBackendExecute),
+#endif
 };
 #undef TUNA_MOCK
 
@@ -1063,6 +1679,11 @@ extern "C" TUNA_MOCK_EXPORT void* tuna_cuda_resolve(const char* symbol) {
     return nullptr;
 }
 
-void MockCudaReset() { g = MockDevice{}; }
+void MockCudaReset() {
+    g = MockDevice{};
+#ifdef TUNA_CUDA_HAVE_CUDNN
+    gd = MockDnn{};
+#endif
+}
 
 MockCudaStats MockCudaGetStats() { return g.stats; }
